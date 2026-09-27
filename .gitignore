@@ -5,7 +5,6 @@ __pycache__/
 
 # Local builds and downloaded FFmpeg binaries. Publish binaries through Releases.
 build/
-dist/
 release/
 ffmpeg/
 MusicToVideo.spec

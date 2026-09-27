@@ -2,6 +2,8 @@
 
 음원을 타임라인에 놓고, 파형을 보면서 이미지와 문구의 표시 시간을 맞춰 **MP4 영상**을 만드는 Windows 프로그램입니다. 여러 음원과 이미지를 사용할 수 있고, 모든 작업은 PC 안에서 처리됩니다.
 
+**Windows용 다운로드:** [Google Drive에서 열기](https://drive.google.com/file/d/1wpl91SbwGffeCzujPD6Aezt0pU2hdmXb/view?usp=drive_link) · [웹 소개 페이지 소스](dist/index.html)
+
 ![편집기 전체 화면: 왼쪽 미디어 목록, 가운데 미리보기, 오른쪽 이미지 속성, 아래 클립 타임라인](docs/images/editor-overview.png)
 
 ## 무엇을 할 수 있나요?
@@ -14,7 +16,7 @@
 
 ## 시작하기
 
-Windows용 실행 파일의 GitHub Release 다운로드 링크는 추후 연결할 예정입니다. 소스에서 실행하려면 **Python 3.10 이상**, Tkinter, FFmpeg, FFprobe가 필요합니다. FFmpeg·FFprobe를 `PATH`에 두거나 이 프로젝트의 `ffmpeg/bin`에 배치하세요.
+Windows용 배포 파일은 위의 Google Drive 링크에서 받을 수 있습니다. 소스에서 실행하려면 **Python 3.10 이상**, Tkinter, FFmpeg, FFprobe가 필요합니다. FFmpeg·FFprobe를 `PATH`에 두거나 이 프로젝트의 `ffmpeg/bin`에 배치하세요.
 
 ```powershell
 python -m pip install -r requirements.txt
@@ -79,3 +81,9 @@ python -m pip install -r requirements-build.txt
 스크립트는 후보 EXE로 실제 MP4를 변환하고 규격을 검사한 뒤 `release/MusicToVideo` 폴더를 만듭니다. **폴더 전체**를 함께 배포해야 합니다. 포함된 FFmpeg 빌드의 GPLv3 고지는 [NOTICE-FFmpeg.txt](NOTICE-FFmpeg.txt)를, 재생 라이브러리의 고지는 `LICENSE-sounddevice.txt`와 `LICENSE-PortAudio.txt`를 확인하세요.
 
 개발·변환 검증 기록과 아직 확인하지 못한 환경은 [VALIDATION.md](VALIDATION.md)에 정리했습니다.
+
+## GitHub Pages 소개 페이지
+
+[dist/index.html](dist/index.html)은 화면 이미지와 스타일을 포함한 **단일 HTML 파일**입니다. 별도 빌드나 외부 이미지 호스팅 없이 브라우저에서 열 수 있습니다. 다운로드 버튼은 위와 같은 Google Drive 주소를 사용합니다.
+
+저장소의 **Settings → Pages → Build and deployment → Source**를 **GitHub Actions**로 설정하세요. `main` 또는 `master` 브랜치에 푸시하면 [.github/workflows/pages.yml](.github/workflows/pages.yml)이 `dist` 폴더를 Pages에 게시합니다. 배포된 주소는 저장소의 Pages 설정이나 Actions 실행 결과에서 확인할 수 있습니다.
