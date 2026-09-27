@@ -86,4 +86,28 @@ python -m pip install -r requirements-build.txt
 
 [dist/index.html](dist/index.html)은 화면 이미지와 스타일을 포함한 **단일 HTML 파일**입니다. 별도 빌드나 외부 이미지 호스팅 없이 브라우저에서 열 수 있습니다. 다운로드 버튼은 위와 같은 Google Drive 주소를 사용합니다.
 
-저장소의 **Settings → Pages → Build and deployment → Source**를 **GitHub Actions**로 설정하세요. `main` 또는 `master` 브랜치에 푸시하면 [.github/workflows/pages.yml](.github/workflows/pages.yml)이 `dist` 폴더를 Pages에 게시합니다. 배포된 주소는 저장소의 Pages 설정이나 Actions 실행 결과에서 확인할 수 있습니다.
+### 현재 저장소에서 게시하기
+
+1. [저장소 Pages 설정](https://github.com/lahuman/makeMp4/settings/pages)에서 **Build and deployment → Source → GitHub Actions**를 선택합니다.
+2. [Actions](https://github.com/lahuman/makeMp4/actions/workflows/pages.yml)에서 **Deploy GitHub Pages → Run workflow → main**으로 첫 배포를 실행합니다.
+3. 배포가 성공하면 [https://lahuman.github.io/makeMp4/](https://lahuman.github.io/makeMp4/)에서 안내 페이지를 확인합니다.
+
+[배포 워크플로](.github/workflows/pages.yml)는 `dist`만 게시합니다. 이후 `main`의 `dist/**` 또는 워크플로가 변경되면 자동으로 배포합니다. Pages를 활성화하기 전 실행이 실패했다면 설정을 마친 후 워크플로를 다시 실행하세요.
+
+### Moon 프로젝트 목록에 등록하기
+
+Moon 블로그의 프로젝트로 등록할 때는 `dist/index.html`의 내용 앞에 아래 Jekyll 머리말을 붙여 `/workspace/Moon/_posts/2026-09-27-music-to-video.html`로 저장합니다. `layout: null`은 안내 페이지 자체의 디자인을 사용하고, `project: true`는 기존 Projects 목록에 자동으로 표시되게 합니다.
+
+```yaml
+---
+layout: null
+title: "음악 파형 슬라이드 편집기"
+date: 2026-09-27 00:00:00 +0900
+excerpt: "음악 파형을 보며 음원·사진·문구를 배치하고 MP4로 저장하는 Windows용 로컬 편집기. 다운로드와 사용 방법을 안내합니다."
+project: true
+comments: false
+permalink: /music-to-video/
+---
+```
+
+Moon의 기존 배포 흐름을 사용합니다. 변경 사항을 Moon의 `master`에 푸시하면 기존 Jekyll 워크플로가 빌드하여 게시합니다. 배포 후 안내 페이지 주소는 [https://lahuman.github.io/music-to-video/](https://lahuman.github.io/music-to-video/)이며, [Projects 목록](https://lahuman.github.io/projects/)에도 나타납니다. 안내 페이지를 수정하면 Moon의 해당 HTML 본문도 함께 갱신하세요.
