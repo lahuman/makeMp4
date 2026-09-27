@@ -1,0 +1,613 @@
+"""Project data, audio analysis, shared rendering, and MP4 export."""
+from __future__ import annotations
+
+import copy
+from array import array
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import threading
+import uuid
+import wave
+
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+
+FPS = 30
+SIZE = (1920, 1080)
+RATE = 48000
+AUDIO_EXTS = {".flac", ".wav", ".mp3"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
+
+
+class EditorError(Exception):
+    pass
+
+
+def uid():
+    return uuid.uuid4().hex[:12]
+
+
+def fresh():
+    return {"version": 2, "audio_assets": [], "audio_clips": [], "assets": [], "images": [], "texts": [],
+            "settings": {"width": 1920, "height": 1080, "fps": 30, "audio_bitrate": "320k"}}
+
+
+def image_defaults(asset, start, end):
+    return {"id": uid(), "asset": asset, "start": int(start), "end": int(end),
+            "motion": False, "easing": "smooth", "from": {"x": 960, "y": 540, "zoom": 100},
+            "to": {"x": 960, "y": 540, "zoom": 100},
+            "transition": {"type": "cut", "frames": 15}}
+
+
+def audio_start(clip):
+    return int(clip["start_sample"])
+
+
+def audio_end(clip):
+    return audio_start(clip) + int(clip["source_out"]) - int(clip["source_in"])
+
+
+def duration_samples(project):
+    return max((audio_end(c) for c in project["audio_clips"]), default=0)
+
+
+def duration_seconds(project):
+    return duration_samples(project) / RATE
+
+
+def valid_interval(items, start, end, exclude=None, start_key="start", end_key="end"):
+    return start >= 0 and end > start and all(
+        item["id"] == exclude or end <= item[start_key] or start >= item[end_key]
+        for item in items)
+
+
+def valid_audio(project, clip, exclude=None):
+    return (audio_start(clip) >= 0 and clip["source_in"] >= 0
+            and clip["source_out"] > clip["source_in"]
+            and all(c["id"] == exclude or audio_end(clip) <= audio_start(c)
+                    or audio_start(clip) >= audio_end(c) for c in project["audio_clips"]))
+
+
+def paths_in(project, project_file):
+    base = Path(project_file).parent
+    data = copy.deepcopy(project)
+    for asset in data["assets"] + data.get("audio_assets", []):
+        asset["path"] = str((base / asset["path"]).resolve())
+    if data.get("audio"):
+        data["audio"] = str((base / data["audio"]).resolve())
+    return data
+
+
+def save_project(project, path):
+    path = Path(path)
+    data = copy.deepcopy(project)
+    data.pop("_migrated", None)
+    def relative(value):
+        try:
+            return os.path.relpath(Path(value).resolve(), path.parent.resolve())
+        except ValueError:
+            return str(Path(value).resolve())
+    if data.get("audio"):
+        data["audio"] = relative(data["audio"])
+    for asset in data["assets"] + data.get("audio_assets", []):
+        asset["path"] = relative(asset["path"])
+    temp = path.with_name("." + path.name + "." + uid() + ".tmp")
+    try:
+        temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temp, path)
+    except OSError as e:
+        raise EditorError(f"프로젝트 저장 실패: 폴더 권한과 여유 공간을 확인하세요.\n{e}") from e
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def load_project(path):
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        if data.get("version") not in (1, 2) or not all(k in data for k in ("assets", "images", "texts")):
+            raise ValueError("지원하지 않는 프로젝트 형식")
+        data = paths_in(data, path)
+        if data["version"] == 1:
+            migrate_v1(data)
+        return data
+    except (OSError, ValueError, TypeError, KeyError) as e:
+        raise EditorError(f"프로젝트를 열 수 없습니다. JSON 파일 형식을 확인하세요.\n{e}") from e
+
+
+def missing_media(project):
+    result = []
+    if project.get("audio") and not Path(project["audio"]).is_file():
+        result.append(("audio", None, project["audio"]))
+    for a in project.get("audio_assets", []):
+        if not Path(a["path"]).is_file():
+            result.append(("audio", a["id"], a["path"]))
+    for a in project["assets"]:
+        if not Path(a["path"]).is_file():
+            result.append(("image", a["id"], a["path"]))
+    return result
+
+
+def migrate_v1(project):
+    """Keep v1 timing and its native-size (never enlarged) image display."""
+    old_audio = project.pop("audio", "")
+    project["audio_assets"] = []
+    project["audio_clips"] = []
+    duration = 0.0
+    if old_audio:
+        try:
+            # The precise decoded sample count is filled by the UI after analysis.
+            duration = float(project.get("duration", 0))
+        except (TypeError, ValueError):
+            pass
+        ident = uid()
+        project["audio_assets"].append({"id": ident, "path": old_audio, "samples": int(duration * RATE)})
+        project["audio_clips"].append({"id": uid(), "asset": ident, "start_sample": 0,
+                                       "source_in": 0, "source_out": int(duration * RATE)})
+    cues = sorted(project["images"], key=lambda c: c["start"])
+    fallback_end = max((t["end"] for t in project["texts"]), default=1)
+    if duration:
+        fallback_end = max(fallback_end, total_frames(duration))
+    for i, cue in enumerate(cues):
+        cue["end"] = cues[i+1]["start"] if i+1 < len(cues) else fallback_end
+        cue.update({k: v for k, v in image_defaults(cue["asset"], cue["start"], cue["end"]).items()
+                    if k not in cue and k != "id"})
+        cue["legacy_native"] = True
+    project["version"] = 2
+    project["_migrated"] = True
+
+
+def probe_audio(path, ffprobe):
+    command = [ffprobe, "-v", "error", "-select_streams", "a:0", "-show_entries",
+               "format=duration:stream=codec_name,sample_rate,channels", "-of", "json", str(path)]
+    try:
+        p = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except OSError as e:
+        raise EditorError("FFprobe를 실행할 수 없습니다. 배포 폴더의 실행 파일을 확인하세요.") from e
+    if p.returncode:
+        raise EditorError("음악을 읽을 수 없습니다. 손상 여부와 FLAC/WAV/MP3 형식을 확인하세요.")
+    try:
+        info = json.loads(p.stdout)
+        return float(info["format"]["duration"])
+    except (KeyError, IndexError, ValueError, TypeError) as e:
+        raise EditorError("음악 길이를 확인할 수 없습니다.") from e
+
+
+def analyze_audio(path, ffmpeg, cancel, report=None):
+    """Decode once to bounded-disk PCM; keep 10 ms min/max waveform bins."""
+    try:
+        fd, name = tempfile.mkstemp(suffix=".wav", prefix="music_preview_")
+    except OSError as e:
+        raise EditorError("음악 분석용 임시 파일을 만들지 못했습니다. 디스크 여유 공간과 권한을 확인하세요.") from e
+    os.close(fd)
+    Path(name).unlink(missing_ok=True)
+    cmd = [ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-i", str(path),
+           "-vn", "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", "-y", name]
+    try:
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.PIPE, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        while p.poll() is None:
+            if cancel.is_set():
+                p.terminate()
+                try: p.wait(2)
+                except subprocess.TimeoutExpired: p.kill(); p.wait()
+                raise EditorError("음악 분석을 취소했습니다.")
+            cancel.wait(.1)
+        error = p.stderr.read().decode("utf-8", "replace")[-500:]
+        if p.returncode:
+            raise EditorError("음악 분석에 실패했습니다. 파일 손상을 확인하세요.\n" + error)
+        bins = []
+        with wave.open(name, "rb") as w:
+            count, rate = w.getnframes(), w.getframerate()
+            chunk_frames = rate // 100
+            while True:
+                if cancel.is_set():
+                    raise EditorError("음악 분석을 취소했습니다.")
+                raw = w.readframes(chunk_frames)
+                if not raw: break
+                from array import array
+                samples = array("h"); samples.frombytes(raw)
+                peak = max((abs(x) for x in samples), default=0) / 32768
+                bins.append(peak)
+                if report and len(bins) % 100 == 0:
+                    report(len(bins) / 100, count / rate)
+        return name, bins, count / rate
+    except Exception:
+        Path(name).unlink(missing_ok=True)
+        raise
+
+
+def analyze_audio_asset(path, ffmpeg, cancel, cache_dir=None):
+    """Decode to interleaved float32 PCM on disk and collect 10 ms peak bins."""
+    source = Path(path)
+    stat = source.stat()
+    key = hashlib.sha256(f"{source.resolve()}|{stat.st_size}|{stat.st_mtime_ns}".encode()).hexdigest()
+    folder = Path(cache_dir) if cache_dir else Path(tempfile.gettempdir()) / "MusicToVideo_PCM"
+    folder.mkdir(parents=True, exist_ok=True)
+    pcm = folder / (key + ".f32le")
+    bins_path = folder / (key + ".json")
+    if pcm.is_file() and bins_path.is_file():
+        try:
+            bins = json.loads(bins_path.read_text(encoding="utf-8"))
+            if pcm.stat().st_size % 8 == 0:
+                return str(pcm), bins, pcm.stat().st_size // 8
+        except (OSError, ValueError):
+            pass
+    temp = folder / (key + "." + uid() + ".part")
+    command = [ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-i", str(path),
+               "-vn", "-ac", "2", "-ar", str(RATE), "-f", "f32le", "-c:a", "pcm_f32le", "-y", str(temp)]
+    try:
+        p = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.PIPE, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        while p.poll() is None:
+            if cancel.is_set():
+                p.terminate()
+                try: p.wait(2)
+                except subprocess.TimeoutExpired: p.kill(); p.wait()
+                raise EditorError("음악 분석을 취소했습니다.")
+            cancel.wait(.1)
+        error = p.stderr.read().decode("utf-8", "replace")[-500:]
+        if p.returncode or not temp.is_file() or temp.stat().st_size == 0:
+            raise EditorError("음악 분석 실패: 파일 손상 또는 지원하지 않는 오디오를 확인하세요.\n" + error)
+        bins = []
+        block = RATE // 100
+        with temp.open("rb") as f:
+            while True:
+                if cancel.is_set(): raise EditorError("음악 분석을 취소했습니다.")
+                raw = f.read(block * 8)
+                if not raw: break
+                samples = array("f"); samples.frombytes(raw)
+                bins.append(max((abs(v) for v in samples), default=0.0))
+        os.replace(temp, pcm)
+        bins_path.write_text(json.dumps(bins), encoding="utf-8")
+        return str(pcm), bins, pcm.stat().st_size // 8
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def total_frames(duration):
+    return max(1, math.ceil(duration * FPS - 1e-9))
+
+
+def active_image(project, frame):
+    cues = sorted((c for c in project["images"] if c["start"] <= frame < c["end"]),
+                  key=lambda c: c["start"])
+    return cues[-1] if cues else None
+
+
+def transform_at(cue, frame):
+    first = cue.get("from", {"x": 960, "y": 540, "zoom": 100})
+    if not cue.get("motion") or cue["end"] - cue["start"] <= 1:
+        return first
+    last = cue.get("to", first)
+    fraction = max(0, min(1, (frame - cue["start"]) / (cue["end"] - cue["start"] - 1)))
+    if cue.get("easing", "smooth") == "smooth":
+        fraction = fraction * fraction * (3 - 2 * fraction)
+    return {key: first[key] + (last[key] - first[key]) * fraction for key in ("x", "y", "zoom")}
+
+
+def image_layer(project, cue, frame):
+    canvas = Image.new("RGBA", SIZE, (0, 0, 0, 0))
+    asset = next((a for a in project["assets"] if a["id"] == cue["asset"]), None)
+    if not asset: return canvas
+    try:
+        with Image.open(asset["path"]) as src:
+            image = ImageOps.exif_transpose(src).convert("RGBA")
+    except (OSError, ValueError) as e:
+        raise EditorError(f"이미지를 읽을 수 없습니다: {asset['path']}\n{e}") from e
+    fitted = min(SIZE[0] / image.width, SIZE[1] / image.height)
+    if cue.get("legacy_native"): fitted = min(1, fitted)
+    state = transform_at(cue, frame)
+    factor = fitted * max(10, min(500, float(state["zoom"]))) / 100
+    width, height = max(1, round(image.width * factor)), max(1, round(image.height * factor))
+    image = image.resize((width, height), Image.Resampling.LANCZOS)
+    x, y = round(state["x"] - width / 2), round(state["y"] - height / 2)
+    canvas.paste(image, (x, y))
+    return canvas
+
+
+def image_bounds(project, cue, frame):
+    asset = next((a for a in project["assets"] if a["id"] == cue["asset"]), None)
+    if not asset: return None
+    with Image.open(asset["path"]) as source:
+        oriented = ImageOps.exif_transpose(source)
+        width, height = oriented.size
+    fitted = min(SIZE[0] / width, SIZE[1] / height)
+    if cue.get("legacy_native"): fitted = min(1, fitted)
+    state = transform_at(cue, frame)
+    factor = fitted * max(10, min(500, float(state["zoom"]))) / 100
+    w,h=max(1,round(width*factor)),max(1,round(height*factor))
+    return (state["x"]-w/2,state["y"]-h/2,state["x"]+w/2,state["y"]+h/2)
+
+
+def transition_info(project, cue):
+    value = cue.get("transition", {})
+    effect = value.get("type", "cut")
+    previous = next((other for other in project["images"]
+                     if other["id"] != cue["id"] and other["end"] == cue["start"]), None)
+    length = min(int(value.get("frames", 15)), cue["end"] - cue["start"])
+    if not previous or length <= 1: effect = "cut"
+    return effect, max(0, length), previous
+
+
+def dynamic_frame(project, frame):
+    cue = active_image(project, frame)
+    if cue and cue.get("motion"): return True
+    if cue:
+        effect, length, _ = transition_info(project, cue)
+        if effect != "cut" and frame < cue["start"] + length: return True
+    return False
+
+
+def font_file(name):
+    path = Path(name)
+    if path.is_file():
+        return str(path), False
+    fonts = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts"
+    candidate = fonts / name
+    if candidate.is_file():
+        return str(candidate), False
+    fallback = fonts / "malgun.ttf"
+    if fallback.is_file():
+        return str(fallback), True
+    return "DejaVuSans.ttf", True
+
+
+def wrap_lines(draw, text, font, max_width):
+    result = []
+    for paragraph in text.split("\n"):
+        line = ""
+        for char in paragraph:
+            test = line + char
+            if line and draw.textbbox((0, 0), test, font=font)[2] > max_width:
+                result.append(line)
+                line = char
+            else:
+                line = test
+        result.append(line)
+    return result
+
+
+def text_layout(item):
+    """Return the shared font, wrapped lines, and output-space bounds."""
+    path, _ = font_file(item.get("font", "malgun.ttf"))
+    font = ImageFont.truetype(path, int(item["size"]))
+    width = max(80, min(1900, int(item["width"])))
+    draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    lines = wrap_lines(draw, item["text"], font, width - 28)
+    ascent, descent = font.getmetrics()
+    spacing = max(4, int(item["size"] * .2))
+    height = max(1, len(lines)) * (ascent + descent + spacing) + 18
+    left = int(item["x"] - width / 2)
+    top = int(item["y"])
+    return font, lines, spacing, (left, top, left + width, top + height)
+
+
+def text_box(item):
+    return text_layout(item)[3]
+
+
+def render_scene(project, frame, warn=None):
+    """The one compositor used for the editor preview and exported stills."""
+    canvas = Image.new("RGBA", SIZE, (0, 0, 0, 255))
+    cue = active_image(project, frame)
+    if cue:
+        incoming = image_layer(project, cue, frame)
+        effect, length, previous = transition_info(project, cue)
+        if effect != "cut" and frame < cue["start"] + length:
+            outgoing = image_layer(project, previous, previous["end"] - 1)
+            progress = (frame - cue["start"] + 1) / length
+            if effect == "dissolve":
+                picture = Image.blend(outgoing, incoming, progress)
+            elif effect == "fade_black":
+                picture = outgoing.copy() if progress < .5 else incoming.copy()
+                opacity = 1 - progress * 2 if progress < .5 else (progress - .5) * 2
+                picture.putalpha(round(255 * max(0, min(1, opacity))))
+            elif effect == "slide":
+                picture = Image.new("RGBA", SIZE)
+                offset = round(SIZE[0] * progress)
+                picture.paste(outgoing, (-offset, 0))
+                picture.paste(incoming, (SIZE[0] - offset, 0))
+            else: picture = incoming
+            canvas = Image.alpha_composite(canvas, picture)
+        else:
+            canvas = Image.alpha_composite(canvas, incoming)
+    visible = sorted((t for t in project["texts"] if t["start"] <= frame < t["end"]),
+                     key=lambda t: t.get("order", 0))
+    for item in visible:
+        layer = Image.new("RGBA", SIZE, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(layer)
+        _, fallback = font_file(item.get("font", "malgun.ttf"))
+        if fallback and warn: warn(item.get("font", "malgun.ttf"))
+        try:
+            font, lines, spacing, (left, top, right, bottom) = text_layout(item)
+        except OSError as e:
+            raise EditorError("글꼴을 읽지 못했습니다. 다른 글꼴을 선택하세요.") from e
+        width = right - left
+        ascent, descent = font.getmetrics()
+        height = bottom - top
+        bg = item.get("background", "#000000")
+        alpha = max(0, min(255, int(item.get("background_alpha", 160))))
+        if alpha:
+            rgb = tuple(int(bg.lstrip("#")[i:i+2], 16) for i in (0, 2, 4))
+            draw.rounded_rectangle((left, top, left + width, top + height),
+                                   radius=12, fill=rgb + (alpha,))
+        align = item.get("align", "center")
+        for index, line in enumerate(lines):
+            text_width = draw.textbbox((0, 0), line or " ", font=font)[2]
+            x = left + 14 if align == "left" else left + width - 14 - text_width if align == "right" else left + (width - text_width) / 2
+            y = top + 9 + index * (ascent + descent + spacing)
+            draw.text((x, y), line, font=font, fill=item.get("color", "#ffffff"),
+                      stroke_width=max(0, int(item.get("outline", 2))), stroke_fill="#000000")
+        canvas = Image.alpha_composite(canvas, layer)
+    return canvas.convert("RGB")
+
+
+def scene_boundaries(project, frames):
+    values = {0, frames}
+    for cue in project["images"]:
+        values.add(max(0, min(frames, int(cue["start"]))))
+        values.add(max(0, min(frames, int(cue["end"]))))
+        effect, length, _ = transition_info(project, cue)
+        if effect != "cut": values.add(max(0, min(frames, cue["start"] + length)))
+    for item in project["texts"]:
+        values.add(max(0, min(frames, int(item["start"]))))
+        values.add(max(0, min(frames, int(item["end"]))))
+    return sorted(values)
+
+
+def concat_path(path):
+    return str(Path(path).resolve()).replace("\\", "/").replace("'", "'\\''")
+
+
+def assemble_audio(project, pcm_paths, destination, cancel):
+    """Write one sample-accurate f32le timeline without loading sources in memory."""
+    clips = sorted(project["audio_clips"], key=audio_start)
+    cursor = 0
+    zero = bytes(8 * 16384)
+    with Path(destination).open("wb") as out:
+        for clip in clips:
+            if cancel.is_set(): raise EditorError("작업을 취소했습니다.")
+            if not valid_audio(project, clip, clip["id"]):
+                raise EditorError("음원 클립의 시간 범위가 올바르지 않습니다.")
+            gap = audio_start(clip) - cursor
+            if gap < 0: raise EditorError("음원 클립이 겹칩니다. 타임라인에서 위치를 조정하세요.")
+            while gap:
+                amount = min(gap, 16384)
+                out.write(zero[:amount * 8]); gap -= amount
+            asset = next((a for a in project["audio_assets"] if a["id"] == clip["asset"]), None)
+            if not asset: raise EditorError("음원 파일 참조를 찾지 못했습니다.")
+            source = pcm_paths.get(asset["id"])
+            if not source or not Path(source).is_file():
+                raise EditorError("음원 분석 캐시가 없습니다. 음원을 다시 분석하세요.")
+            remaining = clip["source_out"] - clip["source_in"]
+            with Path(source).open("rb") as inp:
+                inp.seek(clip["source_in"] * 8)
+                while remaining:
+                    if cancel.is_set(): raise EditorError("작업을 취소했습니다.")
+                    raw = inp.read(min(remaining, 16384) * 8)
+                    if not raw: raise EditorError("음원 사용 구간이 원본 길이를 넘습니다. 다시 분석하세요.")
+                    out.write(raw); remaining -= len(raw) // 8
+            cursor = audio_end(clip)
+    return cursor
+
+
+def _run_encoder(command, cancel, progress=None, input_frames=None):
+    """Read both FFmpeg pipes so a full pipe cannot stall cancellation."""
+    p = subprocess.Popen(command, stdin=subprocess.PIPE if input_frames is not None else subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    errors = []
+    def drain(pipe, collect):
+        while True:
+            raw = pipe.readline()
+            if not raw: break
+            if collect:
+                errors.append(raw.decode("utf-8", "replace"))
+                if len(errors) > 60: del errors[:20]
+    readers = [threading.Thread(target=drain, args=(p.stdout, False), daemon=True),
+               threading.Thread(target=drain, args=(p.stderr, True), daemon=True)]
+    for t in readers: t.start()
+    finished = threading.Event()
+    def interrupt_on_cancel():
+        while not finished.is_set() and p.poll() is None:
+            if cancel.wait(.05):
+                if not finished.is_set() and p.poll() is None: p.terminate()
+                return
+    watchdog = threading.Thread(target=interrupt_on_cancel, daemon=True)
+    watchdog.start()
+    try:
+        if input_frames is not None:
+            for number, image in enumerate(input_frames):
+                if cancel.is_set(): raise EditorError("작업을 취소했습니다.")
+                p.stdin.write(image.tobytes())
+                if progress and number % 3 == 0: progress(number)
+            p.stdin.close()
+        while p.poll() is None:
+            if cancel.is_set(): raise EditorError("작업을 취소했습니다.")
+            cancel.wait(.1)
+        for t in readers: t.join(2)
+        if p.returncode:
+            raise EditorError("MP4 변환 실패: FFmpeg와 입력 파일, 디스크 공간을 확인하세요.\n" + "".join(errors)[-1000:])
+    except (BrokenPipeError, OSError) as e:
+        if cancel.is_set(): raise EditorError("작업을 취소했습니다.") from e
+        raise EditorError("MP4 변환 실패: 인코더 입력이 중단되었습니다.\n" + str(e) + "\n" + "".join(errors)[-700:]) from e
+    finally:
+        finished.set()
+        if p.poll() is None:
+            p.terminate()
+            try: p.wait(2)
+            except subprocess.TimeoutExpired: p.kill(); p.wait()
+
+
+def export_video(project, duration, output, ffmpeg, cancel, report=None, pcm_paths=None):
+    """Encode static spans once and motion/transition spans as streamed frames."""
+    output = Path(output).resolve()
+    if output.exists(): raise EditorError("같은 이름의 출력 파일이 있습니다. 새 이름을 지정하세요.")
+    if not output.parent.is_dir(): raise EditorError("저장 폴더가 없습니다.")
+    if not project["audio_clips"]: raise EditorError("타임라인에 음원을 배치하세요.")
+    if missing_media(project): raise EditorError("원본 미디어가 없습니다. 프로젝트에서 파일을 다시 연결하세요.")
+    pcm_paths = pcm_paths or {}
+    frames = total_frames(duration_seconds(project))
+    if frames <= 0: raise EditorError("영상 구간이 없습니다.")
+    try:
+        fd, temp_name = tempfile.mkstemp(prefix="." + output.stem + "_", suffix=".tmp.mp4", dir=output.parent)
+        os.close(fd); Path(temp_name).unlink(missing_ok=True)
+    except OSError as e:
+        raise EditorError("저장 폴더에 쓰기 실패: 권한과 디스크 공간을 확인하세요.\n" + str(e)) from e
+    try:
+        with tempfile.TemporaryDirectory(prefix="music_video_scenes_") as temporary:
+            scratch = Path(temporary)
+            audio_path = scratch / "timeline.f32le"
+            written = assemble_audio(project, pcm_paths, audio_path, cancel)
+            if written != duration_samples(project): raise EditorError("음원 타임라인 길이가 일치하지 않습니다.")
+            if report: report(5)
+            boundaries = scene_boundaries(project, frames)
+            manifest_lines = ["ffconcat version 1.0"]
+            for index, (begin, end) in enumerate(zip(boundaries, boundaries[1:])):
+                if cancel.is_set(): raise EditorError("작업을 취소했습니다.")
+                if begin == end: continue
+                count = end - begin
+                segment = scratch / f"segment_{index:06d}.mp4"
+                dynamic = any(dynamic_frame(project, frame) for frame in (begin, end-1))
+                if dynamic:
+                    command = [ffmpeg, "-hide_banner", "-nostdin", "-y", "-f", "rawvideo",
+                               "-pixel_format", "rgb24", "-video_size", "1920x1080", "-framerate", "30",
+                               "-i", "pipe:0", "-vf", "format=yuv420p", "-c:v", "libx264",
+                               "-preset", "medium", "-crf", "23", "-frames:v", str(count), "-an", str(segment)]
+                    _run_encoder(command, cancel, lambda n: report(5 + int(75*(begin+n)/frames)) if report else None,
+                                 (render_scene(project, f) for f in range(begin, end)))
+                else:
+                    image_path = scratch / f"scene_{index:06d}.png"
+                    render_scene(project, begin).save(image_path)
+                    command = [ffmpeg, "-hide_banner", "-nostdin", "-y", "-loop", "1", "-framerate", "30",
+                               "-i", str(image_path), "-vf", "format=yuv420p", "-c:v", "libx264",
+                               "-preset", "medium", "-tune", "stillimage", "-crf", "23", "-r", "30",
+                               "-frames:v", str(count), "-an", str(segment)]
+                    _run_encoder(command, cancel)
+                    image_path.unlink()
+                manifest_lines.append(f"file '{concat_path(segment)}'")
+                if report: report(5 + int(75 * end / frames))
+            manifest = scratch / "scenes.ffconcat"
+            manifest.write_text("\n".join(manifest_lines) + "\n", encoding="utf-8")
+            command = [ffmpeg, "-hide_banner", "-nostdin", "-y", "-f", "concat", "-safe", "0",
+                       "-i", str(manifest), "-f", "f32le", "-ar", "48000", "-ac", "2", "-i", str(audio_path),
+                       "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-frames:v", str(frames),
+                       "-c:a", "aac", "-b:a", "320k", "-movflags", "+faststart", temp_name]
+            _run_encoder(command, cancel)
+            if cancel.is_set(): raise EditorError("작업을 취소했습니다.")
+            if not Path(temp_name).is_file() or Path(temp_name).stat().st_size < 1024:
+                raise EditorError("MP4 결과 파일이 비어 있습니다. 디스크 공간을 확인하세요.")
+            os.rename(temp_name, output)
+            if report: report(100)
+            return output
+    except FileExistsError as e:
+        raise EditorError("같은 이름의 출력 파일이 생겼습니다. 새 이름을 지정하세요.") from e
+    except OSError as e:
+        raise EditorError("저장 실패: 쓰기 권한과 디스크 공간을 확인하세요.\n" + str(e)) from e
+    finally:
+        Path(temp_name).unlink(missing_ok=True)

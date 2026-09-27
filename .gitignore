@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Local builds and downloaded FFmpeg binaries. Publish binaries through Releases.
+build/
+dist/
+release/
+ffmpeg/
+MusicToVideo.spec
+
+# Local backup and validation media; README screenshots live in docs/images.
+_source_backup/
+_validation/
+UI_PREVIEW.png
