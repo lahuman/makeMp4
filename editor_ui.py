@@ -7,6 +7,7 @@ import math
 import os
 from pathlib import Path
 import queue
+import re
 import threading
 import time
 import tkinter as tk
@@ -31,8 +32,7 @@ class EditorApp:
     def __init__(self, root):
         self.root = root
         self.root.title("음악 파형 슬라이드 편집기")
-        self.root.geometry("1420x850")
-        self.root.minsize(1040, 680)
+        self._default_window_geometry()
         self.project = core.fresh()
         self.project_file = None
         self.dirty = False
@@ -67,6 +67,7 @@ class EditorApp:
         self.library_markers = {}
         self._library_signature = None
         self.ui_settings_file = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "MusicToVideo" / "ui.json"
+        self._panes_initialized = False
         self.drag = None
         self.preview_drag = None
         self.thumb_refs = []
@@ -102,7 +103,7 @@ class EditorApp:
         self.project_search.trace_add("write", lambda *_: self._refresh_library())
         self.library_view.trace_add("write", lambda *_: self._refresh_library())
         self._restore_ui_settings()
-        self.root.after(120, self._set_initial_panes)
+        self.root.after_idle(self._set_initial_panes)
         self.root.after(80, self._poll)
         self.root.after(80, self._tick)
 
@@ -122,17 +123,38 @@ class EditorApp:
             return "break"
         return None
 
+    def _default_window_geometry(self):
+        # Leave room for the taskbar and window decorations on smaller displays.
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        width = min(1420, max(1, screen_width - 80))
+        height = min(850, max(1, screen_height - 120))
+        self.root.minsize(min(1040, width), min(680, height))
+        top = max(0, (screen_height - height - 120) // 2)
+        self.root.geometry(f"{width}x{height}+{(screen_width-width)//2}+{top}")
+
     def _restore_ui_settings(self):
+        self.saved_panes = None
         try:
             data = json.loads(self.ui_settings_file.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return
             self.saved_panes = data.get("panes", None)
             geometry = data.get("geometry", "")
-            if geometry and "x" in geometry:
-                self.root.geometry(geometry)
-        except (OSError, ValueError):
+            size = re.fullmatch(r"(\d+)x(\d+)(?:[+-]\d+[+-]\d+)?", geometry) if isinstance(geometry, str) else None
+            if size:
+                width, height = map(int, size.groups())
+                if (0 < width <= self.root.winfo_screenwidth() - 80
+                        and 0 < height <= self.root.winfo_screenheight() - 120):
+                    self.root.geometry(geometry)
+                else:
+                    self.saved_panes = None
+        except (OSError, ValueError, tk.TclError):
             self.saved_panes = None
 
     def _save_ui_settings(self):
+        if not self._panes_initialized:
+            return
         try:
             self.ui_settings_file.parent.mkdir(parents=True, exist_ok=True)
             positions = [self.body.sashpos(0), self.body.sashpos(1), self.workspace.sashpos(0)] if len(self.body.panes()) == 3 else None
@@ -141,12 +163,31 @@ class EditorApp:
             pass
 
     def _set_initial_panes(self):
-        if self.root.winfo_exists():
-            width = self.root.winfo_width()
-            positions = self.saved_panes if isinstance(self.saved_panes, list) and len(self.saved_panes) == 3 else None
-            self.body.sashpos(0, positions[0] if positions else min(270, max(210, int(width*.19))))
-            self.body.sashpos(1, positions[1] if positions else max(650, width-300))
-            self.workspace.sashpos(0, positions[2] if positions else int(self.workspace.winfo_height()*.59))
+        if not self.root.winfo_exists():
+            return
+        # A frozen application's first map can arrive after startup timers fire.
+        # Wait for mapping, then flush geometry work before measuring the panes.
+        if not self.root.winfo_ismapped():
+            self.root.after(50, self._set_initial_panes)
+            return
+        self.root.update_idletasks()
+        width = self.body.winfo_width()
+        height = self.workspace.winfo_height()
+        if width <= 1 or height <= 1:
+            self.root.after(50, self._set_initial_panes)
+            return
+        positions = self.saved_panes
+        if not (isinstance(positions, list) and len(positions) == 3
+                and all(type(value) is int for value in positions)
+                and 140 <= positions[0] <= positions[1] - 320
+                and positions[1] <= width - 180
+                and 160 <= positions[2] <= height - 140):
+            positions = [min(270, max(210, int(width*.19))),
+                         max(650, width-300), int(height*.59)]
+        self.body.sashpos(0, positions[0])
+        self.body.sashpos(1, positions[1])
+        self.workspace.sashpos(0, positions[2])
+        self._panes_initialized = True
 
     def tool(self, name):
         from music_to_video import bundled_tool
@@ -335,9 +376,11 @@ class EditorApp:
         for side in ("left", "right"):
             panel = getattr(self, side)
             if str(panel) not in self.body.panes(): self.toggle_panel(side)
-        self.root.geometry("1420x850")
+        self.root.state("normal")
+        self._default_window_geometry()
         self.saved_panes = None
-        self.root.after(100, self._set_initial_panes)
+        self._panes_initialized = False
+        self.root.after_idle(self._set_initial_panes)
 
     def _scroll_timeline_y(self, *args):
         self.timeline.yview(*args)
