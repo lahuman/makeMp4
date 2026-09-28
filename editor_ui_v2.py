@@ -79,7 +79,7 @@ class EditorApp(BaseEditor):
         self.duration_label.configure(text="영상 " + clock(self.duration))
         self.audio_info.configure(text=f"음원 {len(self.project['audio_assets'])}개 · 클립 {len(self.project['audio_clips'])}개")
         self.time_label.set(clock(self.position) + " / " + clock(self.duration))
-        self.root.title(("● " if self.dirty else "") + "음악 파형 슬라이드 편집기")
+        self.root.title(("● " if self.dirty else "") + "선율담")
         if self.composition_dialog and self.composition_dialog.winfo_exists():
             self._refresh_composition()
 
@@ -1268,7 +1268,7 @@ class EditorApp(BaseEditor):
         if not self.project["audio_clips"] or any(c["asset"] not in self.audio_cache for c in self.project["audio_clips"]):
             self.status.set("음원 분석이 끝나면 재생할 수 있습니다."); return
         self.play_stop=threading.Event(); cancel=self.play_stop
-        self.playing=True; self.play_button.configure(text="Ⅱ 일시정지")
+        self.playing=True; self._set_play_button(True)
         start_sample=min(core.duration_samples(self.project),round(self.position*core.RATE))
         self.play_epoch=start_sample/core.RATE
         clips=copy.deepcopy(self.project["audio_clips"])

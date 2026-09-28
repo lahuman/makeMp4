@@ -15,10 +15,12 @@ import wave
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parent
-RELEASE = ROOT / "release" / "MusicToVideo"
+RELEASE = ROOT / "release" / "Seonyuldam"
 SOURCE_FFMPEG = ROOT / "ffmpeg"
 if not (SOURCE_FFMPEG / "bin" / "ffmpeg.exe").is_file():
-    SOURCE_FFMPEG = RELEASE / "ffmpeg"
+    SOURCE_FFMPEG = next((folder / "ffmpeg" for folder in
+                          (RELEASE, ROOT / "release" / "MusicToVideo")
+                          if (folder / "ffmpeg" / "bin" / "ffmpeg.exe").is_file()), SOURCE_FFMPEG)
 
 
 def main():
@@ -29,15 +31,17 @@ def main():
     candidate_root = build / "release-candidate"
     command = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
                "--windowed", "--onedir", "--exclude-module", "numpy",
-               "--name", "MusicToVideo", "--distpath", str(candidate_root),
-               "--workpath", str(build / "pyinstaller"), str(ROOT / "music_to_video.py")]
+               "--icon", str(ROOT / "assets" / "app_icon.ico"),
+               "--add-data", str(ROOT / "assets" / "app_icon.png") + ";assets",
+               "--name", "Seonyuldam", "--distpath", str(candidate_root),
+               "--workpath", str(build / "pyinstaller"), str(ROOT / "seonyuldam.py")]
     subprocess.run(command, cwd=ROOT, check=True)
-    candidate = candidate_root / "MusicToVideo"
+    candidate = candidate_root / "Seonyuldam"
     dest_ff = candidate / "ffmpeg"
     (dest_ff / "bin").mkdir(parents=True, exist_ok=True)
     for item in ("bin/ffmpeg.exe", "bin/ffprobe.exe", "LICENSE", "README.txt"):
         shutil.copy2(SOURCE_FFMPEG / item, dest_ff / item)
-    for name in ("NOTICE-FFmpeg.txt", "music_to_video.py", "editor_core.py",
+    for name in ("NOTICE-FFmpeg.txt", "seonyuldam.py", "music_to_video.py", "editor_core.py",
                  "editor_ui.py", "editor_ui_v2.py", "requirements.txt", "README.md",
                  "VALIDATION.md", "LICENSE-PortAudio.txt", "LICENSE-sounddevice.txt"):
         shutil.copy2(ROOT / name, candidate / name)
@@ -50,7 +54,7 @@ def main():
                             for n in range(48000))
             file.writeframes(data)
         Image.new("RGB", (300, 500), "#2070c0").save(image)
-        result = subprocess.run([str(candidate / "MusicToVideo.exe"), "--convert",
+        result = subprocess.run([str(candidate / "Seonyuldam.exe"), "--convert",
                                  str(audio), str(image), str(output)],
                                 timeout=90, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         if result.returncode or not output.is_file():
@@ -66,9 +70,9 @@ def main():
         if not any(x["codec_name"] == "aac" for x in streams):
             raise RuntimeError("배포 EXE의 AAC 검사에 실패했습니다.")
     RELEASE.parent.mkdir(exist_ok=True)
-    ready = RELEASE.parent / ("MusicToVideo.ready-" + uuid.uuid4().hex[:8])
+    ready = RELEASE.parent / ("Seonyuldam.ready-" + uuid.uuid4().hex[:8])
     shutil.copytree(candidate, ready)
-    backup = RELEASE.parent / ("MusicToVideo.previous-" + uuid.uuid4().hex[:8])
+    backup = RELEASE.parent / ("Seonyuldam.previous-" + uuid.uuid4().hex[:8])
     if RELEASE.exists(): RELEASE.rename(backup)
     try:
         ready.rename(RELEASE)
@@ -77,7 +81,7 @@ def main():
         raise
     if backup.exists():
         resolved = backup.resolve()
-        if resolved.parent != (ROOT / "release").resolve() or not resolved.name.startswith("MusicToVideo.previous-"):
+        if resolved.parent != (ROOT / "release").resolve() or not resolved.name.startswith("Seonyuldam.previous-"):
             raise RuntimeError("배포 백업 경로가 예상 범위를 벗어났습니다.")
         shutil.rmtree(resolved)
     print("배포 완료:", RELEASE)

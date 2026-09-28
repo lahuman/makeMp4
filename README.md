@@ -1,4 +1,4 @@
-# 음악 파형 슬라이드 편집기
+# 선율담
 
 음원을 타임라인에 놓고, 파형을 보면서 이미지와 문구의 표시 시간을 맞춰 **MP4 영상**을 만드는 Windows 프로그램입니다. 같은 시간에 이미지와 음원을 여러 개 겹쳐 배치할 수 있으며, 모든 작업은 PC 안에서 처리됩니다.
 
@@ -6,7 +6,7 @@
 
 ![최신 편집기 화면: 겹친 이미지 2개와 음악 2개가 각각 별도 타임라인 행에 표시되고, 오른쪽에서 이미지 앞뒤 순서를 조절하는 모습](docs/images/editor-overview.png)
 
-화면 예시는 설명을 위해 만든 샘플 미디어입니다. 병렬 배치 기능은 현재 소스 코드에 반영되어 있으며, 기존 다운로드 파일은 새 EXE가 배포되기 전까지 이전 버전일 수 있습니다.
+화면 예시는 설명을 위해 만든 샘플 미디어입니다. 병렬 배치 기능과 선율담 명칭은 현재 소스 코드에 반영되어 있으며, 기존 다운로드 파일은 이전 이름의 EXE와 기능을 포함할 수 있습니다.
 
 ## 무엇을 할 수 있나요?
 
@@ -24,8 +24,10 @@ Windows용 배포 파일은 위의 Google Drive 링크에서 받을 수 있습�
 
 ```powershell
 python -m pip install -r requirements.txt
-python music_to_video.py
+python seonyuldam.py
 ```
+
+기존 `python music_to_video.py` 실행 및 모듈 가져오기도 호환용 진입점으로 계속 지원합니다.
 
 Python 없이 실행할 폴더를 직접 만들려면 아래 [배포 폴더 만들기](#배포-폴더-만들기)를 참고하세요.
 
@@ -76,7 +78,7 @@ Python 없이 실행할 폴더를 직접 만들려면 아래 [배포 폴더 만�
 - 사진 비율 유지, 검은 여백, EXIF 회전 및 투명 PNG 반영
 - 기본 글꼴은 Windows의 맑은 고딕. 글꼴을 찾지 못하면 대체 글꼴을 사용하고 화면에 알림
 - 긴 이미지 움직임 구간은 프레임마다 계산하므로 정적 영상보다 내보내기에 시간이 더 걸릴 수 있음
-- 음원 분석 캐시는 Windows 임시 폴더의 `MusicToVideo_PCM`에 보관되어 같은 파일을 다시 사용할 때 재활용됨
+- 음원 분석 캐시는 Windows 임시 폴더의 `Seonyuldam_PCM`에 보관되어 같은 파일을 다시 사용할 때 재활용됨. 이전 `MusicToVideo_PCM` 캐시가 있으면 계속 사용
 
 ## 배포 폴더 만들기
 
@@ -87,13 +89,14 @@ python -m pip install -r requirements-build.txt
 .\build_windows.bat
 ```
 
-스크립트는 후보 EXE로 실제 MP4를 변환하고 규격을 검사한 뒤 `release/MusicToVideo` 폴더를 만듭니다. **폴더 전체**를 함께 배포해야 합니다. 포함된 FFmpeg 빌드의 GPLv3 고지는 [NOTICE-FFmpeg.txt](NOTICE-FFmpeg.txt)를, 재생 라이브러리의 고지는 `LICENSE-sounddevice.txt`와 `LICENSE-PortAudio.txt`를 확인하세요.
+스크립트는 후보 EXE로 실제 MP4를 변환하고 규격을 검사한 뒤 `release/Seonyuldam` 폴더를 만듭니다. **폴더 전체**를 함께 배포해야 합니다. 포함된 FFmpeg 빌드의 GPLv3 고지는 [NOTICE-FFmpeg.txt](NOTICE-FFmpeg.txt)를, 재생 라이브러리의 고지는 `LICENSE-sounddevice.txt`와 `LICENSE-PortAudio.txt`를 확인하세요.
 
 개발·변환 검증 기록과 아직 확인하지 못한 환경은 [VALIDATION.md](VALIDATION.md)에 정리했습니다.
 
 ## GitHub Pages 소개 페이지
 
 [dist/index.html](dist/index.html)은 화면 이미지와 스타일을 포함한 **단일 HTML 파일**입니다. 별도 빌드나 외부 이미지 호스팅 없이 브라우저에서 열 수 있습니다. 다운로드 버튼은 위와 같은 Google Drive 주소를 사용합니다.
+선율담 배경 음악은 [YouTube 영상](https://youtu.be/Bo8o20NVfHU)을 삽입해 페이지를 열 때 자동 재생을 시도합니다. 브라우저가 소리 있는 자동 재생을 제한하면 방문자가 플레이어에서 재생할 수 있습니다.
 
 ### 현재 저장소에서 게시하기
 
@@ -110,9 +113,9 @@ Moon 블로그의 프로젝트로 등록할 때는 `dist/index.html`의 내용 �
 ```yaml
 ---
 layout: null
-title: "음악 파형 슬라이드 편집기"
+title: "선율담"
 date: 2026-09-27 00:00:00 +0900
-excerpt: "음악 파형을 보며 음원·사진·문구를 배치하고 MP4로 저장하는 Windows용 로컬 편집기. 다운로드와 사용 방법을 안내합니다."
+excerpt: "선율담은 음악 파형을 보며 음원·사진·문구를 배치하고 MP4로 저장하는 Windows용 로컬 편집기입니다."
 project: true
 comments: false
 permalink: /music-to-video/

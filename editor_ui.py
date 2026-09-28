@@ -49,7 +49,7 @@ def frame_of(seconds, duration):
 class EditorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("음악 파형 슬라이드 편집기")
+        self.root.title("선율담")
         self._default_window_geometry()
         self.project = core.fresh()
         self.project_file = None
@@ -84,7 +84,9 @@ class EditorApp:
         self.timeline_thumbnail_cache = {}
         self.library_markers = {}
         self._library_signature = None
-        self.ui_settings_file = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "MusicToVideo" / "ui.json"
+        settings_root = Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
+        self.ui_settings_file = settings_root / "Seonyuldam" / "ui.json"
+        self.legacy_ui_settings_file = settings_root / "MusicToVideo" / "ui.json"
         self._panes_initialized = False
         self.drag = None
         self.preview_drag = None
@@ -154,7 +156,8 @@ class EditorApp:
     def _restore_ui_settings(self):
         self.saved_panes = None
         try:
-            data = json.loads(self.ui_settings_file.read_text(encoding="utf-8"))
+            settings_file = self.ui_settings_file if self.ui_settings_file.is_file() else self.legacy_ui_settings_file
+            data = json.loads(settings_file.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 return
             self.saved_panes = data.get("panes", None)
@@ -208,7 +211,7 @@ class EditorApp:
         self._panes_initialized = True
 
     def tool(self, name):
-        from music_to_video import bundled_tool
+        from seonyuldam import bundled_tool
         result = bundled_tool(name)
         if not result:
             raise core.EditorError(f"{name}를 찾지 못했습니다. 배포 폴더의 ffmpeg/bin을 확인하세요.")
@@ -218,7 +221,7 @@ class EditorApp:
         self._apply_theme()
         self._build_menu()
         top = ttk.Frame(self.root, style="Header.TFrame", padding=(16, 10)); top.pack(fill="x")
-        ttk.Label(top, text="음악 파형 슬라이드 편집기", style="Header.TLabel").pack(side="left")
+        ttk.Label(top, text="선율담", style="Header.TLabel").pack(side="left")
         self.duration_label = ttk.Label(top, text="음악 00:00.000", style="HeaderMuted.TLabel")
         self.duration_label.pack(side="left", padx=16)
         ttk.Button(top, text="MP4 내보내기", style="Primary.TButton", command=self.start_export).pack(side="right")
@@ -266,6 +269,9 @@ class EditorApp:
         transport = ttk.Frame(center, style="Panel.TFrame", padding=(8, 5)); transport.pack(fill="x")
         ttk.Button(transport, text="|◀", width=3, command=lambda: self.seek(0)).pack(side="left")
         ttk.Button(transport, text="◀", width=3, command=lambda: self.seek(self.position - 1/core.FPS)).pack(side="left")
+        self.pause_icon = tk.PhotoImage(master=self.root, width=14, height=14)
+        for x in (2, 9):
+            self.pause_icon.put(UI_COLORS["text"], to=(x, 2, x+3, 12))
         self.play_button = ttk.Button(transport, text="▶ 재생", command=self.toggle_play)
         self.play_button.pack(side="left", padx=4)
         ttk.Button(transport, text="▶|", width=3, command=lambda: self.seek(self.position + 1/core.FPS)).pack(side="left")
@@ -482,7 +488,7 @@ class EditorApp:
         self.duration_label.configure(text="음악 " + clock(self.duration))
         self.audio_info.configure(text=(Path(self.project["audio"]).name + "  ·  " + clock(self.duration)) if self.project["audio"] else "음악을 가져오세요")
         self.time_label.set(clock(self.position) + " / " + clock(self.duration))
-        self.root.title(("● " if self.dirty else "") + "음악 파형 슬라이드 편집기")
+        self.root.title(("● " if self.dirty else "") + "선율담")
 
     def _refresh_library(self):
         self._library_signature = (tuple((a["id"], a["path"]) for a in self.project["assets"]),
@@ -1212,11 +1218,15 @@ class EditorApp:
         if self.playing: self._stop_audio()
         else: self._start_audio()
 
+    def _set_play_button(self, playing):
+        self.play_button.configure(text="일시정지" if playing else "▶ 재생",
+                                   image=self.pause_icon if playing else "", compound="left")
+
     def _start_audio(self):
         if not self.pcm:
             self.status.set("음악 분석이 끝나면 재생할 수 있습니다."); return
         self.play_stop=threading.Event(); cancel=self.play_stop
-        self.playing=True; self.play_button.configure(text="Ⅱ 일시정지")
+        self.playing=True; self._set_play_button(True)
         start=min(self.duration,self.position)
         self.play_epoch=start
         def worker():
@@ -1242,7 +1252,7 @@ class EditorApp:
         if self.playing:
             self.play_stop.set()
             self.playing=False
-            self.play_button.configure(text="▶ 재생")
+            self._set_play_button(False)
 
     def _tick(self):
         if self.playing:

@@ -37,8 +37,8 @@ class InitialLayoutTests(unittest.TestCase):
         self.root.destroy()
         self.assertEqual(self.callback_errors, [])
 
-    def settings(self, data):
-        path = Path(self.folder.name) / "MusicToVideo" / "ui.json"
+    def settings(self, data, legacy=False):
+        path = Path(self.folder.name) / ("MusicToVideo" if legacy else "Seonyuldam") / "ui.json"
         path.parent.mkdir(exist_ok=True)
         path.write_text(json.dumps(data), encoding="utf-8")
         return path
@@ -86,6 +86,16 @@ class InitialLayoutTests(unittest.TestCase):
         app._save_ui_settings()
         saved = json.loads(app.ui_settings_file.read_text(encoding="utf-8"))
         self.assertEqual(saved["panes"], [230, 950, 350])
+
+    def test_previous_app_settings_are_loaded_and_saved_under_new_name(self):
+        self.settings({"geometry": "1280x720+0+0", "panes": [230, 950, 350]}, legacy=True)
+        app = EditorApp(self.root)
+        self.root.deiconify()
+        self.settle()
+        self.assertEqual([app.body.sashpos(0), app.body.sashpos(1), app.workspace.sashpos(0)], [230, 950, 350])
+        app._save_ui_settings()
+        self.assertEqual(app.ui_settings_file.parent.name, "Seonyuldam")
+        self.assertTrue(app.ui_settings_file.is_file())
 
     def test_malformed_pane_values_fall_back_to_defaults(self):
         self.settings({"panes": [None, "900", {}]})

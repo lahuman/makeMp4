@@ -3,9 +3,9 @@ FFmpeg notice
 
 The supplied Python-free Windows build includes FFmpeg 9.0.2 essentials
 binaries from gyan.dev. This is a static GPL version 3 build, including
-libx264. The complete license is in release/MusicToVideo/ffmpeg/LICENSE;
+libx264. The complete license is in release/Seonyuldam/ffmpeg/LICENSE;
 the exact build configuration and external component list are in
-release/MusicToVideo/ffmpeg/README.txt.
+release/Seonyuldam/ffmpeg/README.txt.
 
 FFmpeg source corresponding to the build:
 https://github.com/FFmpeg/FFmpeg/commit/946fcce07b
@@ -15,4 +15,4 @@ This application invokes the standalone FFmpeg and FFprobe programs as separate
 processes and does not link to FFmpeg libraries. The FFmpeg binaries were
 obtained from https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip.
 
-The MusicToVideo Python source is separate from FFmpeg.
+The Seonyuldam Python source is separate from FFmpeg.

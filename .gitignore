@@ -8,6 +8,7 @@ build/
 release/
 ffmpeg/
 MusicToVideo.spec
+Seonyuldam.spec
 
 # Local backup and validation media; README screenshots live in docs/images.
 _source_backup/

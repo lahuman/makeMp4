@@ -1,5 +1,12 @@
 # 검증 결과
 
+## 선율담 명칭 변경 (2026-09-28)
+
+- 앱 창·소개 페이지·문서·실행 진입점과 Windows 배포 파일 이름을 선율담/Seonyuldam으로 맞췄습니다. 기존 UI 설정, PCM 캐시, 로컬 FFmpeg 배포 경로는 계속 읽습니다.
+- `.venv\Scripts\python.exe -m unittest discover -s tests -q`: 자동 테스트 21개 통과. 기존 UI 설정을 새 경로로 저장하는 검사도 포함합니다.
+- `.venv\Scripts\python.exe build_release.py`: `release/Seonyuldam/Seonyuldam.exe`를 만들고 샘플 MP4의 영상·음성 규격 검사를 통과했습니다.
+- `docs/images/`의 앱 화면을 새 이름으로 다시 캡처하고 `dist/index.html`의 이미지에도 반영했습니다. GitHub Pages, Moon 블로그, Google Drive의 공개 파일은 로컬 변경만으로 갱신되지 않습니다.
+
 ## 병렬 이미지·음악 편집 (2026-09-28)
 
 - 현재 소스에서 이미지·음악 겹침을 허용하고, 타임라인에 종류별 여러 행을 표시합니다. 이미지 앞뒤 순서 변경과 실행 취소, 겹친 이미지의 미리보기 합성, 겹친 음원의 재생·출력 믹싱을 확인했습니다.

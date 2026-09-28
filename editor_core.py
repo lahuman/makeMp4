@@ -224,7 +224,13 @@ def analyze_audio_asset(path, ffmpeg, cancel, cache_dir=None):
     source = Path(path)
     stat = source.stat()
     key = hashlib.sha256(f"{source.resolve()}|{stat.st_size}|{stat.st_mtime_ns}".encode()).hexdigest()
-    folder = Path(cache_dir) if cache_dir else Path(tempfile.gettempdir()) / "MusicToVideo_PCM"
+    if cache_dir:
+        folder = Path(cache_dir)
+    else:
+        cache_root = Path(tempfile.gettempdir())
+        new_folder = cache_root / "Seonyuldam_PCM"
+        legacy_folder = cache_root / "MusicToVideo_PCM"
+        folder = new_folder if new_folder.exists() or not legacy_folder.exists() else legacy_folder
     folder.mkdir(parents=True, exist_ok=True)
     pcm = folder / (key + ".f32le")
     bins_path = folder / (key + ".json")
