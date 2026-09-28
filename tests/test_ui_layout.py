@@ -5,9 +5,13 @@ from pathlib import Path
 import tempfile
 import time
 import tkinter as tk
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from PIL import Image
+
+import editor_core as core
 from editor_ui_v2 import EditorApp
 
 
@@ -29,7 +33,7 @@ class InitialLayoutTests(unittest.TestCase):
     def destroy_root(self):
         self.root.update_idletasks()
         for timer in self.root.tk.call("after", "info"):
-            self.root.after_cancel(timer)
+            self.root.tk.call("after", "cancel", timer)
         self.root.destroy()
         self.assertEqual(self.callback_errors, [])
 
@@ -128,6 +132,117 @@ class InitialLayoutTests(unittest.TestCase):
             self.settle()
             self.assertEqual((self.root.winfo_width(), self.root.winfo_height()), (1200, 600))
             self.assert_default_panes(app)
+
+    def test_canvas_text_width_drag_and_undo(self):
+        app = EditorApp(self.root)
+        app.project["audio_assets"] = [{"id": "audio", "path": "test.wav", "samples": 480000}]
+        app.project["audio_clips"] = [{"id": "music", "asset": "audio", "start_sample": 0,
+                                       "source_in": 0, "source_out": 480000}]
+        self.root.deiconify()
+        self.settle()
+        app._refresh()
+        app.add_text(0)
+        item = app._selected()
+        original_width = item["width"]
+        l, top, r, bottom = core.text_box(item)
+        x, y, w, h = app.preview_rect
+        handle_x = round(x + r * w / 1920)
+        handle_y = round(y + (top + bottom) * h / 2160)
+        self.assertEqual(app._preview_target(handle_x, handle_y)[2], "width_right")
+        app._preview_down(SimpleNamespace(x=handle_x, y=handle_y))
+        app._preview_move(SimpleNamespace(x=handle_x + 25, y=handle_y))
+        app._preview_up(SimpleNamespace(x=handle_x + 25, y=handle_y))
+        self.assertGreater(app._selected()["width"], original_width)
+        app.undo_action()
+        self.assertEqual(app.project["texts"][0]["width"], original_width)
+
+    def test_image_handle_direct_edit_and_composition_gaps(self):
+        app = EditorApp(self.root)
+        image_path = Path(self.folder.name) / "sample.png"
+        Image.new("RGB", (1600, 900), "#456789").save(image_path)
+        app.project["audio_assets"] = [{"id": "audio", "path": "test.wav", "samples": 480000}]
+        app.project["audio_clips"] = [{"id": "music", "asset": "audio", "start_sample": 0,
+                                       "source_in": 0, "source_out": 480000}]
+        app.project["assets"] = [{"id": "photo", "path": str(image_path)}]
+        image = core.image_defaults("photo", 0, 150)
+        app.project["images"] = [image]
+        self.root.deiconify()
+        self.settle()
+        app._refresh()
+        x, y, w, h = app.preview_rect
+        app._preview_down(SimpleNamespace(x=x + w // 2, y=y + h // 2))
+        self.assertEqual(app.selection, ("image", image["id"]))
+        corner_x, corner_y = x + w, y + h
+        self.assertEqual(app._preview_target(corner_x, corner_y)[2], "zoom")
+        app._preview_down(SimpleNamespace(x=corner_x, y=corner_y))
+        app._preview_move(SimpleNamespace(x=corner_x + 20, y=corner_y + 20))
+        app._preview_up(SimpleNamespace(x=corner_x + 20, y=corner_y + 20))
+        self.assertGreater(app.project["images"][0]["from"]["zoom"], 100)
+        self.assertEqual(app._preview_target(corner_x, corner_y)[2], "zoom")
+        app.show_composition()
+        self.assertTrue(any(row["name"] == "검은 화면" for row in
+                            ({"name": app.composition_tree.item(i, "values")[1]}
+                             for i in app.composition_tree.get_children())))
+        self.assertIn("검은 화면 1곳", app.composition_summary.cget("text"))
+        image_row = next(row for row in app.composition_tree.get_children()
+                         if app.composition_rows[row][1] == image["id"])
+        app.composition_tree.selection_set(image_row)
+        app._composition_edit("duplicate")
+        self.assertEqual(len(app.project["images"]), 2)
+        app.undo_action()
+        self.assertEqual(len(app.project["images"]), 1)
+
+    def test_export_completion_shows_result_details_and_actions(self):
+        app = EditorApp(self.root)
+        app.project["audio_assets"] = [{"id": "audio", "path": "test.wav", "samples": 48000}]
+        app.project["audio_clips"] = [{"id": "music", "asset": "audio", "start_sample": 0,
+                                       "source_in": 0, "source_out": 48000}]
+        app.audio_cache["audio"] = {"pcm": "", "bins": [], "samples": 48000}
+        self.root.deiconify()
+        self.settle()
+        app._refresh()
+        with patch("editor_ui.messagebox.askyesno", return_value=True):
+            app.start_export()
+        result = Path(self.folder.name) / "완료.mp4"
+        result.write_bytes(b"sample output")
+        app.last_output = result
+        app._show_export_result(result)
+        self.assertEqual(app.export_heading.cget("text"), "MP4 생성 완료")
+        self.assertFalse(app.export_form.winfo_manager())
+        self.assertEqual(app.export_result_name.cget("text"), result.name)
+        self.assertTrue(app.export_result_button.winfo_manager())
+        self.assertTrue(app.export_folder_button.winfo_manager())
+        app._copy_export_path()
+        self.assertEqual(self.root.clipboard_get(), str(result))
+        app._close_export_dialog()
+
+    def test_timeline_drag_commits_once_and_rejects_overlap(self):
+        app = EditorApp(self.root)
+        app.project["audio_assets"] = [{"id": "audio", "path": "test.wav", "samples": 480000}]
+        app.project["audio_clips"] = [{"id": "music", "asset": "audio", "start_sample": 0,
+                                       "source_in": 0, "source_out": 480000}]
+        first = core.image_defaults("first", 0, 60)
+        second = core.image_defaults("second", 150, 210)
+        app.project["images"] = [first, second]
+        self.root.deiconify()
+        self.settle()
+        app._refresh()
+        self.assertEqual(app._snap_move_start(116, 30, "image", first["id"], False), 120)
+        y = app.image_y + 25
+        down = SimpleNamespace(x=55, y=y, state=0)
+        moved = SimpleNamespace(x=110, y=y, state=0)
+        app._timeline_down(down)
+        app._timeline_move(moved)
+        app._timeline_up(moved)
+        self.assertEqual(app.project["images"][0]["start"], 30)
+        app.undo_action()
+        self.assertEqual(app.project["images"][0]["start"], 0)
+        overlap = SimpleNamespace(x=275, y=y, state=0)
+        app._timeline_down(down)
+        app._timeline_move(overlap)
+        self.assertFalse(app.drag["valid"])
+        app._timeline_up(overlap)
+        self.assertEqual(app.project["images"][0]["start"], 0)
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ import queue
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from types import SimpleNamespace
 
 from PIL import ImageTk
 
@@ -22,9 +23,11 @@ class EditorApp(BaseEditor):
         self.audio_generation_by_id = {}
         self.audio_token = 0
         self.library_drag = None
+        self._drag_scroll_job = None
+        self.composition_dialog = None
+        self.composition_rows = {}
         self.text_draft = None
         self.revision = 0
-        self.image_mode = tk.BooleanVar(value=False)
         self.motion_key = tk.StringVar(value="from")
         super().__init__(root)
         self.drag = None
@@ -38,6 +41,7 @@ class EditorApp(BaseEditor):
         self.text_source.pack(side="left", padx=6)
         self.text_source.bind("<ButtonPress-1>", lambda e: self._library_start("text", None, e))
         self.preview.bind("<Alt-MouseWheel>", self._image_wheel)
+        self.preview.bind("<Motion>", self._preview_hover)
         self.timeline.bind("<Motion>", self._timeline_hover)
         self.root.bind_all("<B1-Motion>", self._library_motion_anywhere, add="+")
         self.root.bind("<FocusOut>", self._window_focus_out, add="+")
@@ -50,6 +54,7 @@ class EditorApp(BaseEditor):
 
     def _cancel_on_focus_loss(self):
         if self.root.winfo_exists() and self.root.focus_displayof() is None and (self.drag or self.library_drag):
+            self._cancel_drag_scroll()
             self.drag = None; self.library_drag = None; self.draw_timeline()
 
     def _editable(self):
@@ -75,6 +80,8 @@ class EditorApp(BaseEditor):
         self.audio_info.configure(text=f"음원 {len(self.project['audio_assets'])}개 · 클립 {len(self.project['audio_clips'])}개")
         self.time_label.set(clock(self.position) + " / " + clock(self.duration))
         self.root.title(("● " if self.dirty else "") + "음악 파형 슬라이드 편집기")
+        if self.composition_dialog and self.composition_dialog.winfo_exists():
+            self._refresh_composition()
 
     def _refresh_audio_list(self):
         for child in self.audio_list.winfo_children(): child.destroy()
@@ -129,7 +136,8 @@ class EditorApp(BaseEditor):
                   style="PanelTitle.TLabel", wraplength=250).pack(anchor="w")
         self._prop_entry("시작 (초)", f"{item['start']/core.FPS:.3f}", "start_seconds")
         self._prop_entry("끝 (초)", f"{item['end']/core.FPS:.3f}", "end_seconds")
-        ttk.Checkbutton(self.properties, text="미리보기에서 이미지 이동", variable=self.image_mode).pack(anchor="w", pady=5)
+        ttk.Label(self.properties, text="미리보기에서 이미지를 끌어 이동하거나 모서리로 크기를 조절하세요.",
+                  style="Muted.TLabel", wraplength=245).pack(anchor="w", pady=5)
         ttk.Button(self.properties, text="화면 맞춤", command=lambda: self._image_preset("fit")).pack(fill="x")
         ttk.Button(self.properties, text="화면 채움", command=lambda: self._image_preset("fill")).pack(fill="x")
         ttk.Button(self.properties, text="가운데 정렬", command=lambda: self._image_preset("center")).pack(fill="x")
@@ -244,7 +252,7 @@ class EditorApp(BaseEditor):
 
     def _image_wheel(self, event):
         item = self._selected()
-        if not item or self.selection[0] != "image" or not self.image_mode.get(): return
+        if not item or self.selection[0] != "image": return
         key = self.motion_key.get()
         value = item[key]["zoom"] * (1.08 if event.delta > 0 else 1/1.08)
         self._commit("image_zoom", value, item["id"])
@@ -368,11 +376,16 @@ class EditorApp(BaseEditor):
                 drag["trial"] = {"start":frame,"end":min(core.total_frames(self.duration),frame+90)}
                 drag["valid"] = drag["valid"] and drag["trial"]["end"]>frame
         else: drag["valid"] = False
+        if drag["active"]:
+            self.status.set("놓을 수 있는 위치입니다." if drag["valid"] else
+                            "해당 트랙의 빈 구간에 놓으세요. 음원은 분석 완료 후 배치할 수 있습니다.")
+            self._queue_drag_scroll()
         self.draw_timeline()
 
     def _library_drop_anywhere(self, event):
         drag = self.library_drag
         self.library_drag = None
+        self._cancel_drag_scroll()
         if not drag or not drag["active"] or not drag["valid"]: self.draw_timeline(); return
         frame = drag["frame"]
         if drag["kind"] == "image": self.place_asset(drag["id"], frame)
@@ -522,6 +535,121 @@ class EditorApp(BaseEditor):
             if data.get("_migrated"): self.status.set("v1 프로젝트를 변환했습니다. 저장 시 _v2 이름을 사용하세요.")
         except core.EditorError as e: messagebox.showerror("열기 오류", str(e))
 
+    def show_composition(self):
+        if self.composition_dialog and self.composition_dialog.winfo_exists():
+            self.composition_dialog.lift(); self._refresh_composition(); return
+        dialog=tk.Toplevel(self.root)
+        dialog.title("전체 구성")
+        dialog.geometry("780x480")
+        dialog.transient(self.root)
+        self.composition_dialog=dialog
+        body=ttk.Frame(dialog, style="Panel.TFrame", padding=12)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="전체 구성", style="PanelTitle.TLabel").pack(anchor="w")
+        self.composition_summary=ttk.Label(body, style="Muted.TLabel")
+        self.composition_summary.pack(anchor="w", pady=(5, 10))
+        table_wrap=ttk.Frame(body, style="Panel.TFrame")
+        table_wrap.pack(fill="both", expand=True)
+        columns=("kind","name","start","end","note")
+        table=ttk.Treeview(table_wrap, columns=columns, show="headings", selectmode="browse")
+        for key,title,width in (("kind","구분",75),("name","내용",270),("start","시작",100),
+                                ("end","끝",100),("note","상태",150)):
+            table.heading(key,text=title)
+            table.column(key,width=width,stretch=key=="name")
+        table.tag_configure("gap", foreground="#cfaa77")
+        table.tag_configure("outside", foreground="#e47777")
+        scroll=ttk.Scrollbar(table_wrap, orient="vertical", command=table.yview)
+        table.configure(yscrollcommand=scroll.set)
+        table.pack(side="left",fill="both",expand=True)
+        scroll.pack(side="right",fill="y")
+        self.composition_tree=table
+        table.bind("<Double-1>", lambda e: self._jump_to_composition())
+        table.bind("<Return>", lambda e: self._jump_to_composition())
+        actions=ttk.Frame(body, style="Panel.TFrame")
+        actions.pack(fill="x", pady=(10, 0))
+        ttk.Button(actions, text="위치로 이동", command=self._jump_to_composition).pack(side="left")
+        ttk.Button(actions, text="선택 복제", command=lambda: self._composition_edit("duplicate")).pack(side="left", padx=6)
+        ttk.Button(actions, text="선택 삭제", command=lambda: self._composition_edit("delete")).pack(side="left")
+        ttk.Button(actions, text="전체 맞춤", command=self.fit_zoom).pack(side="right")
+        dialog.protocol("WM_DELETE_WINDOW", lambda: (dialog.destroy(), setattr(self,"composition_dialog",None)))
+        self._refresh_composition()
+
+    @staticmethod
+    def _interval_gaps(intervals, limit):
+        if limit<=0: return
+        cursor=0
+        for start,end in sorted(intervals):
+            if start>cursor: yield cursor,min(start,limit)
+            cursor=max(cursor,end)
+            if cursor>=limit: break
+        if cursor<limit: yield cursor,limit
+
+    def _refresh_composition(self):
+        table=self.composition_tree
+        previous=table.selection()
+        previous_item=self.composition_rows.get(previous[0]) if previous else None
+        table.delete(*table.get_children())
+        self.composition_rows={}
+        duration=self.duration
+        entries=[]
+        assets={a["id"]:Path(a["path"]).name for a in self.project["assets"]}
+        audio_assets={a["id"]:Path(a["path"]).name for a in self.project["audio_assets"]}
+        for kind,items in (("image",self.project["images"]),("text",self.project["texts"]),
+                           ("audio",self.project["audio_clips"])):
+            for item in items:
+                if kind=="audio":
+                    start,end=core.audio_start(item)/core.RATE,core.audio_end(item)/core.RATE
+                    name=audio_assets.get(item["asset"],"누락된 음원")
+                else:
+                    start,end=item["start"]/core.FPS,item["end"]/core.FPS
+                    name=assets.get(item["asset"],"누락된 이미지") if kind=="image" else item["text"].replace("\n"," ")
+                entries.append((start,0,kind,item["id"],name,end,
+                                "영상 끝 초과" if end>duration+1e-6 else ""))
+        image_gaps=list(self._interval_gaps(
+            ((i["start"]/core.FPS,i["end"]/core.FPS) for i in self.project["images"]),duration))
+        audio_gaps=list(self._interval_gaps(
+            ((core.audio_start(i)/core.RATE,core.audio_end(i)/core.RATE)
+             for i in self.project["audio_clips"]),duration))
+        for kind,gaps,label in (("image",image_gaps,"검은 화면"),("audio",audio_gaps,"무음")):
+            for start,end in gaps:
+                if end>start: entries.append((start,1,kind,None,label,end,"빈 구간"))
+        names={"image":"이미지","text":"텍스트","audio":"음악"}
+        for index,(start,_,kind,ident,name,end,note) in enumerate(sorted(entries)):
+            row=f"row-{index}"
+            table.insert("","end",iid=row,
+                         values=(names[kind],name[:90],clock(start),clock(end),note),
+                         tags=("gap",) if ident is None else ("outside",) if note else ())
+            self.composition_rows[row]=(kind,ident,start)
+        if previous_item:
+            for row, item in self.composition_rows.items():
+                if item[:2]==previous_item[:2] and (item[1] is not None or item[2]==previous_item[2]):
+                    table.selection_set(row)
+                    break
+        self.composition_summary.configure(text=(
+            f"영상 {clock(duration)}  ·  음악 {len(self.project['audio_clips'])}개  ·  "
+            f"이미지 {len(self.project['images'])}개  ·  텍스트 {len(self.project['texts'])}개  ·  "
+            f"검은 화면 {len(image_gaps)}곳  ·  무음 {len(audio_gaps)}곳"))
+
+    def _jump_to_composition(self):
+        selected=self.composition_tree.selection()
+        if not selected: return
+        kind,ident,start=self.composition_rows[selected[0]]
+        self.selection=(kind,ident) if ident else None
+        self.seek(start)
+        self._show_properties(); self.draw_timeline()
+        full=float(str(self.timeline.cget("scrollregion")).split()[2])
+        self.timeline.xview_moveto(max(0,start*self.zoom-self.timeline.winfo_width()/3)/max(1,full))
+        self.draw_timeline()
+
+    def _composition_edit(self, action):
+        selected=self.composition_tree.selection()
+        if not selected: return
+        kind,ident,_=self.composition_rows[selected[0]]
+        if not ident: return
+        self.selection=(kind,ident)
+        if action=="duplicate": self.duplicate_selected()
+        else: self.delete_selected()
+
     def _x_to_frame(self, x):
         return max(0, round(max(0, x) / self.zoom * core.FPS))
 
@@ -560,6 +688,18 @@ class EditorApp(BaseEditor):
             self.track_header.create_text(8,y,text=label,anchor="w",fill="#d6d6d6")
         self.track_header.yview_moveto(c.yview()[0])
         left,right = max(0,c.canvasx(0)),c.canvasx(c.winfo_width())
+        for kind,intervals,y0,y1,label in (
+            ("image",((i["start"]/core.FPS,i["end"]/core.FPS) for i in self.project["images"]),
+             self.image_y+6,self.image_y+52,"검은 화면"),
+            ("audio",((core.audio_start(i)/core.RATE,core.audio_end(i)/core.RATE)
+                      for i in self.project["audio_clips"]),self.audio_y+6,self.audio_y+56,"무음")):
+            for start,end in self._interval_gaps(intervals,self.duration):
+                x0,x1=start*self.zoom,end*self.zoom
+                if x1<left or x0>right: continue
+                c.create_rectangle(x0,y0,x1,y1,fill="#35333a" if kind=="image" else "#303a3a",
+                                   outline="#6e5960" if kind=="image" else "#526764",dash=(3,3))
+                if x1-x0>70:
+                    c.create_text(x0+6,(y0+y1)/2,text=label,anchor="w",fill="#bca9a8")
         step = next((s for s in (1,2,5,10,30,60,300,600) if s*self.zoom >= 70),1800)
         for sec in range(max(0,int(left/self.zoom/step)*step), int(right/self.zoom)+step,step):
             x = sec*self.zoom
@@ -670,6 +810,41 @@ class EditorApp(BaseEditor):
         closest=min(points,key=lambda p:abs(p-value))
         return closest if abs(closest-value)*self.zoom/core.FPS <= 8 else value
 
+    def _snap_move_start(self, start, length, kind, ident, alt):
+        snapped_start=self._snap_frame(start,kind,ident,alt)
+        snapped_end=self._snap_frame(start+length,kind,ident,alt)-length
+        candidates=[candidate for candidate in (snapped_start,snapped_end) if candidate!=start]
+        return min(candidates,key=lambda candidate:abs(candidate-start)) if candidates else start
+
+    def _queue_drag_scroll(self):
+        if self._drag_scroll_job is None and (self.drag or self.library_drag):
+            self._drag_scroll_job=self.root.after(60,self._drag_scroll_tick)
+
+    def _cancel_drag_scroll(self):
+        if self._drag_scroll_job is not None:
+            self.root.after_cancel(self._drag_scroll_job)
+            self._drag_scroll_job=None
+
+    def _drag_scroll_tick(self):
+        self._drag_scroll_job=None
+        if not (self.drag or self.library_drag): return
+        c=self.timeline
+        x=self.root.winfo_pointerx()-c.winfo_rootx()
+        y=self.root.winfo_pointery()-c.winfo_rooty()
+        if not (0<=x<c.winfo_width() and 0<=y<c.winfo_height()): return
+        near=x<30 or x>c.winfo_width()-30 or y<30 or y>c.winfo_height()-30
+        if not near: return
+        if self.library_drag:
+            self._library_motion_anywhere(SimpleNamespace(x_root=self.root.winfo_pointerx(),
+                                                          y_root=self.root.winfo_pointery()))
+        elif self.drag and self.drag["kind"]!="seek":
+            if x<30: c.xview_scroll(-1,"units")
+            elif x>c.winfo_width()-30: c.xview_scroll(1,"units")
+            if y<30: c.yview_scroll(-1,"units")
+            elif y>c.winfo_height()-30: c.yview_scroll(1,"units")
+            self._timeline_move(SimpleNamespace(x=x,y=y,state=self.drag.get("state",0)),from_scroll=True)
+        self._queue_drag_scroll()
+
     def _timeline_down(self,event):
         self._commit_text_draft(); self.timeline.focus_set()
         c=self.timeline; x=c.canvasx(event.x); y=c.canvasy(event.y)
@@ -690,6 +865,7 @@ class EditorApp(BaseEditor):
             width=right-left
             edge="body"
             if chosen[0] == "transition": edge="transition"
+            elif event.state & 0x1: edge="body"
             elif width < 16: edge="left" if x-left < right-x else "right"
             elif abs(x-left) <= 8: edge="left"
             elif abs(x-right) <= 8: edge="right"
@@ -701,7 +877,7 @@ class EditorApp(BaseEditor):
             self.drag={"kind":"seek","x":x}
             self.seek(self._x_to_frame(x)/core.FPS)
 
-    def _timeline_move(self,event):
+    def _timeline_move(self,event,from_scroll=False):
         drag=self.drag
         if not drag: return
         c=self.timeline; x=c.canvasx(event.x)
@@ -709,11 +885,13 @@ class EditorApp(BaseEditor):
             self.seek(self._x_to_frame(x)/core.FPS); return
         if not drag["active"] and abs(event.x-drag["screen_x"]) < 4: return
         drag["active"]=True
+        drag["state"]=event.state
         self._stop_audio()
-        if event.x < 30: c.xview_scroll(-1,"units"); x=c.canvasx(event.x)
-        elif event.x > c.winfo_width()-30: c.xview_scroll(1,"units"); x=c.canvasx(event.x)
-        if event.y < 30: c.yview_scroll(-1,"units")
-        elif event.y > c.winfo_height()-30: c.yview_scroll(1,"units")
+        if not from_scroll:
+            if event.x < 30: c.xview_scroll(-1,"units"); x=c.canvasx(event.x)
+            elif event.x > c.winfo_width()-30: c.xview_scroll(1,"units"); x=c.canvasx(event.x)
+            if event.y < 30: c.yview_scroll(-1,"units")
+            elif event.y > c.winfo_height()-30: c.yview_scroll(1,"units")
         origin=drag["original"]; trial=copy.deepcopy(origin)
         delta=round((x-drag["x"])*core.FPS/self.zoom)
         edge=drag["edge"]
@@ -721,7 +899,9 @@ class EditorApp(BaseEditor):
         if drag["kind"] == "audio":
             sample_delta=round(delta*core.RATE/core.FPS)
             if edge == "body":
-                frame=self._snap_frame(round(origin["start_sample"]*core.FPS/core.RATE)+delta,"audio",origin["id"],alt)
+                frame=self._snap_move_start(round(origin["start_sample"]*core.FPS/core.RATE)+delta,
+                                            round((origin["source_out"]-origin["source_in"])*core.FPS/core.RATE),
+                                            "audio",origin["id"],alt)
                 trial["start_sample"]=max(0,round(frame*core.RATE/core.FPS))
                 # Exact edge alignment avoids a sub-frame silent gap.
                 for other in self.project["audio_clips"]:
@@ -749,7 +929,8 @@ class EditorApp(BaseEditor):
             drag["valid"]=self._track_at(c.canvasy(event.y))=="audio" and core.valid_audio(self.project,trial,origin["id"])
         else:
             if edge == "body":
-                start=self._snap_frame(origin["start"]+delta,drag["kind"],origin["id"],alt)
+                start=self._snap_move_start(origin["start"]+delta,origin["end"]-origin["start"],
+                                            drag["kind"],origin["id"],alt)
                 trial["start"]=max(0,start); trial["end"]=trial["start"]+origin["end"]-origin["start"]
             elif edge == "left":
                 trial["start"]=min(origin["end"]-1,self._snap_frame(origin["start"]+delta,drag["kind"],origin["id"],alt))
@@ -763,9 +944,16 @@ class EditorApp(BaseEditor):
                                                 trial["start"],trial["end"],origin["id"])
             drag["valid"]=self._track_at(c.canvasy(event.y))==drag["kind"] and valid_time and valid_overlap
         drag["trial"]=trial
+        if drag["kind"]=="audio":
+            begin,end=core.audio_start(trial)/core.RATE,core.audio_end(trial)/core.RATE
+        else: begin,end=trial["start"]/core.FPS,trial["end"]/core.FPS
+        self.status.set((f"{clock(begin)} → {clock(end)}  ·  길이 {clock(end-begin)}" if drag["valid"]
+                         else "놓을 수 없습니다. 트랙 위치, 클립 겹침과 길이를 확인하세요."))
+        self._queue_drag_scroll()
         self.draw_timeline()
 
     def _timeline_up(self,event):
+        self._cancel_drag_scroll()
         drag=self.drag; self.drag=None
         if drag and drag.get("active") and drag.get("valid") and drag.get("trial"):
             item=self._selected()
@@ -775,6 +963,7 @@ class EditorApp(BaseEditor):
 
     def _escape(self,event):
         if self.drag or self.library_drag:
+            self._cancel_drag_scroll()
             self.drag=None; self.library_drag=None; self.draw_timeline(); return "break"
         return None
 
@@ -793,7 +982,7 @@ class EditorApp(BaseEditor):
                  width,height,self.revision)
             if key!=self.scene_cache_key or self.preview_ref is None:
                 picture=core.render_scene(self.project,frame,self._scene_warn)
-                self.preview_ref=ImageTk.PhotoImage(picture.resize((width,height)))
+                self.preview_ref=ImageTk.PhotoImage(picture.resize((width,height)),master=self.root)
                 self.scene_cache_key=key
             self.preview.delete("all"); self.preview.create_image(x,y,image=self.preview_ref,anchor="nw")
             self.preview_rect=(x,y,width,height)
@@ -802,69 +991,137 @@ class EditorApp(BaseEditor):
                 l,t,r,b=core.text_box(item)
                 self.preview.create_rectangle(x+l*scale,y+t*scale,x+r*scale,y+b*scale,
                                               outline="#00d6ff",width=2)
-            if item and self.selection[0]=="image" and self.image_mode.get() and cue and cue["id"]==item["id"]:
+                for hx in (x+l*scale, x+r*scale):
+                    hy=y+(t+b)*scale/2
+                    self.preview.create_rectangle(hx-5,hy-5,hx+5,hy+5,
+                                                  fill="#00d6ff",outline="#ffffff")
+            if item and self.selection[0]=="image" and cue and cue["id"]==item["id"]:
                 state=core.transform_at(item,frame)
                 cx,cy=x+state["x"]*scale,y+state["y"]*scale
-                bounds=core.image_bounds(self.project,item,frame)
+                try: bounds=core.image_bounds(self.project,item,frame)
+                except (OSError,ValueError): bounds=None
                 if bounds:
-                    l,t,r,b=bounds
-                    l,t,r,b=x+l*scale,y+t*scale,x+r*scale,y+b*scale
-                    self.preview.create_rectangle(l,t,r,b,outline="#00d6ff",width=2)
-                    for hx,hy in ((l,t),(r,t),(l,b),(r,b)):
-                        self.preview.create_rectangle(hx-5,hy-5,hx+5,hy+5,
-                                                      fill="#00d6ff",outline="#ffffff")
+                    visible=self._visible_image_bounds(bounds)
+                    if visible:
+                        l,t,r,b=visible
+                        l,t,r,b=x+l*scale,y+t*scale,x+r*scale,y+b*scale
+                        self.preview.create_rectangle(l,t,r,b,outline="#00d6ff",width=2)
+                        for hx,hy in ((l,t),(r,t),(l,b),(r,b)):
+                            self.preview.create_rectangle(hx-5,hy-5,hx+5,hy+5,
+                                                          fill="#00d6ff",outline="#ffffff")
                 self.preview.create_oval(cx-4,cy-4,cx+4,cy+4,outline="#00d6ff",width=2)
                 self.preview.create_text(cx+8,cy-10,text=f"{state['zoom']:.0f}%",anchor="w",fill="#00d6ff")
         except core.EditorError as e:
             self.status.set(str(e).splitlines()[0])
 
-    def _preview_down(self,event):
-        self._commit_text_draft(); self.preview.focus_set()
+    @staticmethod
+    def _visible_image_bounds(bounds):
+        l,t,r,b=bounds
+        visible=(max(0,min(1920,l)),max(0,min(1080,t)),
+                 max(0,min(1920,r)),max(0,min(1080,b)))
+        return visible if visible[2]>visible[0] and visible[3]>visible[1] else None
+
+    def _preview_target(self, px, py):
+        x,y,w,h=self.preview_rect
+        if not (x <= px <= x+w and y <= py <= y+h): return None
         frame=round(self.position*core.FPS)
+        selected=self._selected()
+        if selected and self.selection[0]=="text" and selected["start"]<=frame<selected["end"]:
+            l,t,r,b=core.text_box(selected)
+            middle=y+(t+b)*h/2160
+            if abs(py-middle)<=10:
+                if abs(px-(x+l*w/1920))<=10: return "text",selected,"width_left"
+                if abs(px-(x+r*w/1920))<=10: return "text",selected,"width_right"
+        text=self._preview_hit(px,py)
+        if text: return "text",text,"move"
         cue=core.active_image(self.project,frame)
-        if self.image_mode.get() and cue:
-            self.selection=("image",cue["id"])
-            state=copy.deepcopy(cue[self.motion_key.get()])
-            x,y,w,h=self.preview_rect
-            bounds=core.image_bounds(self.project,cue,frame)
-            mode="move"
+        if cue:
+            try: bounds=core.image_bounds(self.project,cue,frame)
+            except (OSError,ValueError): bounds=None
             if bounds:
                 l,t,r,b=bounds
-                points=((x+l*w/1920,y+t*h/1080),(x+r*w/1920,y+t*h/1080),
-                        (x+l*w/1920,y+b*h/1080),(x+r*w/1920,y+b*h/1080))
-                if any(abs(event.x-px)<=10 and abs(event.y-py)<=10 for px,py in points): mode="zoom"
-            self.preview_drag={"kind":"image","id":cue["id"],"x":event.x,"y":event.y,
-                               "state":state,"mode":mode,"recorded":False}
-            self._show_properties(); self.render_preview()
+                visible=self._visible_image_bounds(bounds)
+                if visible:
+                    vl,vt,vr,vb=visible
+                    corners=((x+vl*w/1920,y+vt*h/1080),(x+vr*w/1920,y+vt*h/1080),
+                             (x+vl*w/1920,y+vb*h/1080),(x+vr*w/1920,y+vb*h/1080))
+                    if self.selection==("image",cue["id"]) and any(
+                            abs(px-hx)<=10 and abs(py-hy)<=10 for hx,hy in corners):
+                        return "image",cue,"zoom"
+                if l <= (px-x)*1920/w <= r and t <= (py-y)*1080/h <= b:
+                    return "image",cue,"move"
+        return None
+
+    def _preview_hover(self,event):
+        if self.preview_drag: return
+        target=self._preview_target(event.x,event.y)
+        cursor="sizing" if target and target[2]=="zoom" else (
+            "sb_h_double_arrow" if target and target[2].startswith("width") else
+            "fleur" if target else "crosshair")
+        if str(self.preview.cget("cursor"))!=cursor: self.preview.configure(cursor=cursor)
+
+    def _preview_down(self,event):
+        self._commit_text_draft(); self.preview.focus_set()
+        target=self._preview_target(event.x,event.y)
+        if not target or not self._editable():
+            self.selection=None; self.library_selection=None; self.preview_drag=None
+            self._show_properties(); self.render_preview(); self.draw_timeline()
             return
-        super()._preview_down(event)
+        kind,item,mode=target
+        self.selection=(kind,item["id"])
+        original=copy.deepcopy(item[self.motion_key.get()] if kind=="image" else
+                               {key:item[key] for key in ("x","y","width")})
+        self.preview_drag={"kind":kind,"id":item["id"],"mode":mode,"x":event.x,"y":event.y,
+                           "original":original,"recorded":False}
+        self._show_properties(); self.render_preview(); self.draw_timeline()
 
     def _preview_move(self,event):
         drag=self.preview_drag
-        if not isinstance(drag,dict): return super()._preview_move(event)
-        if not self._editable(): return
+        if not drag or not self._editable(): return
         item=self._selected()
         if not item or item["id"]!=drag["id"]: return
         dx,dy=event.x-drag["x"],event.y-drag["y"]
         if not drag["recorded"] and max(abs(dx),abs(dy))<4: return
+        _,_,w,h=self.preview_rect
+        origin=drag["original"]
+        if drag["kind"]=="image":
+            trial=dict(origin)
+            if drag["mode"]=="zoom":
+                cx=self.preview_rect[0]+origin["x"]*w/1920
+                cy=self.preview_rect[1]+origin["y"]*h/1080
+                start=math.hypot(drag["x"]-cx,drag["y"]-cy)
+                current=math.hypot(event.x-cx,event.y-cy)
+                trial["zoom"]=max(10,min(500,origin["zoom"]*current/max(1,start)))
+            else:
+                trial["x"]=origin["x"]+dx*1920/w
+                trial["y"]=origin["y"]+dy*1080/h
+            if trial==item[self.motion_key.get()]: return
+        else:
+            trial=dict(origin)
+            if drag["mode"].startswith("width"):
+                left=origin["x"]-origin["width"]/2
+                right=origin["x"]+origin["width"]/2
+                delta=dx*1920/w
+                if drag["mode"]=="width_left": left=min(right-80,max(right-1900,left+delta))
+                else: right=max(left+80,min(left+1900,right+delta))
+                trial["width"]=round(right-left)
+                trial["x"]=(left+right)/2
+            else:
+                trial["x"]=max(0,min(1920,origin["x"]+dx*1920/w))
+                trial["y"]=max(0,min(1080,origin["y"]+dy*1080/h))
+            if all(item[key]==value for key,value in trial.items()): return
         if not drag["recorded"]:
             self._change(); drag["recorded"]=True
-        _,_,w,h=self.preview_rect
-        state=item[self.motion_key.get()]
-        if drag["mode"]=="zoom":
-            state["zoom"]=max(10,min(500,drag["state"]["zoom"]*(1+dx/max(40,w/2))))
-        else:
-            state["x"]=drag["state"]["x"]+dx*1920/w
-            state["y"]=drag["state"]["y"]+dy*1080/h
-        item.pop("legacy_native",None)
+        if drag["kind"]=="image":
+            item[self.motion_key.get()].update(trial)
+            item.pop("legacy_native",None)
+        else: item.update(trial)
         self.scene_cache_key=None; self.render_preview()
 
     def _preview_up(self,event):
-        if isinstance(self.preview_drag,dict):
-            recorded=self.preview_drag["recorded"]
-            self.preview_drag=None
-            if recorded: self._refresh()
-        else: super()._preview_up(event)
+        drag=self.preview_drag
+        self.preview_drag=None
+        if drag and drag["recorded"]: self._refresh()
 
     def seek(self,seconds):
         self._commit_text_draft()
@@ -993,8 +1250,7 @@ class EditorApp(BaseEditor):
                     self.open_file.configure(state="normal"); self.open_folder.configure(state="normal")
                     self._show_job_controls(complete=True); self.status.set("완료: "+str(event[1]))
                     if self.export_dialog and self.export_dialog.winfo_exists():
-                        self.export_status_label.configure(text="완료: "+Path(event[1]).name)
-                        self.export_cancel_button.configure(text="닫기"); self.export_result_button.pack(side="left")
+                        self._show_export_result(event[1])
                 elif kind=="export_error":
                     self.exporting=False; self.cancel_button.configure(state="disabled")
                     self._show_job_controls(); self.status.set(event[1].splitlines()[0])

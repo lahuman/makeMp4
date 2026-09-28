@@ -273,6 +273,8 @@ class EditorApp:
         timeline_bar = ttk.Frame(timeline_area, style="Panel.TFrame", padding=(8, 5)); timeline_bar.pack(fill="x")
         ttk.Label(timeline_bar, text="타임라인", style="PanelTitle.TLabel").pack(side="left", padx=(0, 10))
         ttk.Button(timeline_bar, text="+ 텍스트", command=self.add_text).pack(side="left")
+        if hasattr(self, "show_composition"):
+            ttk.Button(timeline_bar, text="구성 보기", command=self.show_composition).pack(side="left", padx=(6, 0))
         ttk.Checkbutton(timeline_bar, text="스냅", variable=self.snap).pack(side="left", padx=8)
         ttk.Button(timeline_bar, text="+", width=3, command=lambda: self.set_zoom(self.zoom * 1.5)).pack(side="right")
         ttk.Button(timeline_bar, text="−", width=3, command=lambda: self.set_zoom(self.zoom / 1.5)).pack(side="right")
@@ -447,7 +449,7 @@ class EditorApp:
                         im = ImageOps.exif_transpose(src).convert("RGBA")
                         im.thumbnail((96, 64) if icon_view else (42, 32))
                         bg = Image.new("RGBA", im.size, "black"); bg.alpha_composite(im)
-                        photo = ImageTk.PhotoImage(bg)
+                        photo = ImageTk.PhotoImage(bg, master=self.root)
                     if len(self.thumbnail_cache) > 180: self.thumbnail_cache.clear()
                     self.thumbnail_cache[key] = photo
                 self.thumb_refs.append(photo)
@@ -847,7 +849,7 @@ class EditorApp:
             if self.scene_cache_key != cache_key or self.preview_ref is None:
                 image = core.render_scene(self.project, frame, self._scene_warn)
                 image = image.resize((width, height))
-                self.preview_ref = ImageTk.PhotoImage(image)
+                self.preview_ref = ImageTk.PhotoImage(image, master=self.root)
                 self.scene_cache_key = cache_key
             self.preview.delete("all"); self.preview.create_image(x, y, image=self.preview_ref, anchor="nw")
             self.preview_rect = (x, y, width, height)
@@ -1005,7 +1007,7 @@ class EditorApp:
                             with Image.open(path) as source:
                                 frame_image = ImageOps.exif_transpose(source).convert("RGB")
                                 frame_image.thumbnail((48, 34))
-                                thumb = ImageTk.PhotoImage(frame_image)
+                                thumb = ImageTk.PhotoImage(frame_image, master=self.root)
                             if len(self.timeline_thumbnail_cache)>180: self.timeline_thumbnail_cache.clear()
                             self.timeline_thumbnail_cache[key] = thumb
                         c.create_image(x0+5,image_y+29,anchor="w",image=thumb,tags=("image",cue["id"]))
@@ -1205,19 +1207,29 @@ class EditorApp:
         self.export_dialog = dialog
         body = ttk.Frame(dialog, style="Panel.TFrame", padding=18)
         body.pack(fill="both", expand=True)
-        ttk.Label(body, text="MP4 내보내기", style="PanelTitle.TLabel").pack(anchor="w", pady=(0, 12))
+        self.export_heading = ttk.Label(body, text="MP4 내보내기", style="PanelTitle.TLabel")
+        self.export_heading.pack(anchor="w", pady=(0, 12))
         default_folder = self.project_file.parent if self.project_file else Path.home() / "Videos"
         self.export_folder_var = tk.StringVar(value=str(default_folder))
         self.export_name_var = tk.StringVar(value=(self.project_file.stem if self.project_file else "음악 영상") + ".mp4")
-        ttk.Label(body, text="파일 이름").pack(anchor="w")
-        name_entry = ttk.Entry(body, textvariable=self.export_name_var, width=48)
+        self.export_form = ttk.Frame(body, style="Panel.TFrame")
+        self.export_form.pack(fill="x")
+        ttk.Label(self.export_form, text="파일 이름").pack(anchor="w")
+        name_entry = ttk.Entry(self.export_form, textvariable=self.export_name_var, width=48)
         name_entry.pack(fill="x", pady=(3, 9))
-        ttk.Label(body, text="저장 폴더").pack(anchor="w")
-        folder_row = ttk.Frame(body, style="Panel.TFrame"); folder_row.pack(fill="x", pady=(3, 10))
+        ttk.Label(self.export_form, text="저장 폴더").pack(anchor="w")
+        folder_row = ttk.Frame(self.export_form, style="Panel.TFrame"); folder_row.pack(fill="x", pady=(3, 10))
         ttk.Entry(folder_row, textvariable=self.export_folder_var).pack(side="left", fill="x", expand=True)
         ttk.Button(folder_row, text="찾기…", command=self._browse_export_folder).pack(side="right", padx=(6, 0))
-        ttk.Label(body, text=f"{clock(self.duration)}  ·  1920×1080  ·  30fps  ·  H.264 / AAC",
+        ttk.Label(self.export_form, text=f"{clock(self.duration)}  ·  1920×1080  ·  30fps  ·  H.264 / AAC",
                   style="Muted.TLabel").pack(anchor="w", pady=(2, 12))
+        self.export_result_frame = ttk.Frame(body, style="Panel.TFrame")
+        self.export_result_name = ttk.Label(self.export_result_frame, style="PanelTitle.TLabel", wraplength=320)
+        self.export_result_name.pack(anchor="w", pady=(0, 8))
+        self.export_result_details = ttk.Label(self.export_result_frame, style="Muted.TLabel", wraplength=320)
+        self.export_result_details.pack(anchor="w", pady=(0, 8))
+        self.export_result_path = ttk.Label(self.export_result_frame, style="Muted.TLabel", wraplength=320)
+        self.export_result_path.pack(anchor="w", pady=(0, 8))
         self.export_status_label = ttk.Label(body, text="저장 위치를 확인하세요.", style="Muted.TLabel")
         self.export_status_label.pack(anchor="w", pady=(0, 4))
         self.export_dialog_progress = ttk.Progressbar(body, maximum=100, variable=self.progress)
@@ -1229,6 +1241,8 @@ class EditorApp:
         self.export_cancel_button = ttk.Button(buttons, text="닫기", command=self._close_export_dialog)
         self.export_cancel_button.pack(side="right", padx=7)
         self.export_result_button = ttk.Button(buttons, text="결과 열기", command=self.open_result)
+        self.export_folder_button = ttk.Button(buttons, text="폴더 열기", command=self.open_result_folder)
+        self.export_copy_button = ttk.Button(buttons, text="경로 복사", command=self._copy_export_path)
         dialog.protocol("WM_DELETE_WINDOW", self._close_export_dialog)
         dialog.grab_set()
         name_entry.focus_set()
@@ -1244,6 +1258,31 @@ class EditorApp:
             return
         if self.export_dialog and self.export_dialog.winfo_exists(): self.export_dialog.destroy()
         self.export_dialog = None
+
+    def _show_export_result(self, path):
+        result = Path(path)
+        if not self.export_dialog or not self.export_dialog.winfo_exists(): return
+        size = result.stat().st_size if result.is_file() else 0
+        self.export_heading.configure(text="MP4 생성 완료")
+        self.export_form.pack_forget()
+        self.export_dialog_progress.pack_forget()
+        self.export_result_name.configure(text=result.name)
+        self.export_result_details.configure(
+            text=f"길이 {clock(self.duration)}  ·  파일 크기 {size / 1048576:.1f} MB\n1920×1080  ·  30fps")
+        self.export_result_path.configure(text=str(result))
+        self.export_result_frame.pack(fill="x", before=self.export_status_label)
+        self.export_status_label.configure(text="영상이 저장되었습니다.")
+        self.export_start_button.pack_forget()
+        self.export_cancel_button.configure(text="닫기")
+        self.export_folder_button.pack(side="left", padx=(7, 0))
+        self.export_result_button.pack(side="left", padx=(7, 0))
+        self.export_copy_button.pack(side="left", padx=(7, 0))
+
+    def _copy_export_path(self):
+        if not self.last_output: return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(str(self.last_output))
+        self.export_status_label.configure(text="저장 경로를 복사했습니다.")
 
     def _export_from_dialog(self):
         name = self.export_name_var.get().strip()
@@ -1327,9 +1366,7 @@ class EditorApp:
                     self._show_job_controls(complete=True)
                     self.status.set("완료: "+str(event[1]))
                     if self.export_dialog and self.export_dialog.winfo_exists():
-                        self.export_status_label.configure(text="완료: " + Path(event[1]).name)
-                        self.export_cancel_button.configure(text="닫기")
-                        self.export_result_button.pack(side="left")
+                        self._show_export_result(event[1])
                     else: messagebox.showinfo("완료","MP4를 저장했습니다.\n"+str(event[1]))
                 elif kind=="export_error":
                     self.exporting=False; self.cancel_button.configure(state="disabled")
