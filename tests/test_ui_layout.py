@@ -250,7 +250,7 @@ class InitialLayoutTests(unittest.TestCase):
         self.assertTrue(any(app.timeline.itemcget(item, "outline") == "#6366F1"
                             for item in clip_items if app.timeline.type(item) == "rectangle"))
 
-    def test_timeline_drag_commits_once_and_rejects_overlap(self):
+    def test_timeline_drag_commits_once_and_allows_parallel_images(self):
         app = EditorApp(self.root)
         app.project["audio_assets"] = [{"id": "audio", "path": "test.wav", "samples": 480000}]
         app.project["audio_clips"] = [{"id": "music", "asset": "audio", "start_sample": 0,
@@ -274,9 +274,41 @@ class InitialLayoutTests(unittest.TestCase):
         overlap = SimpleNamespace(x=275, y=y, state=0)
         app._timeline_down(down)
         app._timeline_move(overlap)
-        self.assertFalse(app.drag["valid"])
+        self.assertTrue(app.drag["valid"])
         app._timeline_up(overlap)
-        self.assertEqual(app.project["images"][0]["start"], 0)
+        self.assertGreater(app.project["images"][0]["start"], 0)
+        self.assertLess(app.project["images"][0]["start"], second["end"])
+        self.assertEqual(len(app._media_lanes(app.project["images"],
+                                              lambda clip: clip["start"], lambda clip: clip["end"])), 2)
+
+    def test_parallel_audio_and_image_tracks_have_separate_rows(self):
+        app = EditorApp(self.root)
+        app.project["audio_assets"] = [{"id": "a", "path": "one.wav", "samples": 480000}]
+        app.audio_cache["a"] = {"pcm": "", "bins": [], "samples": 480000}
+        app.place_audio("a", 0)
+        app.place_audio("a", 30)
+        app.project["assets"] = [{"id": "p", "path": "one.png"}]
+        app.place_asset("p", 0)
+        app.place_asset("p", 30)
+        self.root.deiconify()
+        self.settle()
+        app.draw_timeline()
+        labels = [app.track_header.itemcget(item, "text") for item in app.track_header.find_all()
+                  if app.track_header.type(item) == "text"]
+        self.assertIn("이미지 2", labels)
+        self.assertIn("음악 2", labels)
+        self.assertEqual(len(app.project["audio_clips"]), 2)
+        self.assertEqual(len(app.project["images"]), 2)
+        back, front = app.project["images"]
+        app.selection = ("image", front["id"])
+        app._move_image_layer(-1)
+        self.assertEqual(core.active_image(app.project, 30)["id"], back["id"])
+        self.assertEqual(app.project["images"][0]["id"], front["id"])
+        image_lanes = app._media_lanes(app.project["images"],
+                                       lambda clip: clip["start"], lambda clip: clip["end"], stacked=True)
+        self.assertEqual(image_lanes[-1][0]["id"], back["id"])
+        app.undo_action()
+        self.assertEqual(app.project["images"][-1]["id"], front["id"])
 
 
 if __name__ == "__main__":

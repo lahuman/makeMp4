@@ -67,9 +67,7 @@ def valid_interval(items, start, end, exclude=None, start_key="start", end_key="
 
 def valid_audio(project, clip, exclude=None):
     return (audio_start(clip) >= 0 and clip["source_in"] >= 0
-            and clip["source_out"] > clip["source_in"]
-            and all(c["id"] == exclude or audio_end(clip) <= audio_start(c)
-                    or audio_start(clip) >= audio_end(c) for c in project["audio_clips"]))
+            and clip["source_out"] > clip["source_in"])
 
 
 def paths_in(project, project_file):
@@ -274,9 +272,13 @@ def total_frames(duration):
 
 
 def active_image(project, frame):
-    cues = sorted((c for c in project["images"] if c["start"] <= frame < c["end"]),
-                  key=lambda c: c["start"])
-    return cues[-1] if cues else None
+    return next((c for c in reversed(project["images"])
+                 if c["start"] <= frame < c["end"]), None)
+
+
+def active_images(project, frame):
+    """Image list order is the layer order, from back to front."""
+    return [c for c in project["images"] if c["start"] <= frame < c["end"]]
 
 
 def transform_at(cue, frame):
@@ -335,9 +337,8 @@ def transition_info(project, cue):
 
 
 def dynamic_frame(project, frame):
-    cue = active_image(project, frame)
-    if cue and cue.get("motion"): return True
-    if cue:
+    for cue in active_images(project, frame):
+        if cue.get("motion"): return True
         effect, length, _ = transition_info(project, cue)
         if effect != "cut" and frame < cue["start"] + length: return True
     return False
@@ -394,8 +395,7 @@ def text_box(item):
 def render_scene(project, frame, warn=None):
     """The one compositor used for the editor preview and exported stills."""
     canvas = Image.new("RGBA", SIZE, (0, 0, 0, 255))
-    cue = active_image(project, frame)
-    if cue:
+    for cue in active_images(project, frame):
         incoming = image_layer(project, cue, frame)
         effect, length, previous = transition_info(project, cue)
         if effect != "cut" and frame < cue["start"] + length:
@@ -465,35 +465,63 @@ def concat_path(path):
 
 
 def assemble_audio(project, pcm_paths, destination, cancel):
-    """Write one sample-accurate f32le timeline without loading sources in memory."""
-    clips = sorted(project["audio_clips"], key=audio_start)
-    cursor = 0
-    zero = bytes(8 * 16384)
-    with Path(destination).open("wb") as out:
+    """Write a sample-accurate mix of every active clip in bounded chunks."""
+    from contextlib import ExitStack
+    clips = project["audio_clips"]
+    if any(not valid_audio(project, clip) for clip in clips):
+        raise EditorError("음원 클립의 시간 범위가 올바르지 않습니다.")
+    with ExitStack() as stack:
+        streams = {}
         for clip in clips:
-            if cancel.is_set(): raise EditorError("작업을 취소했습니다.")
-            if not valid_audio(project, clip, clip["id"]):
-                raise EditorError("음원 클립의 시간 범위가 올바르지 않습니다.")
-            gap = audio_start(clip) - cursor
-            if gap < 0: raise EditorError("음원 클립이 겹칩니다. 타임라인에서 위치를 조정하세요.")
-            while gap:
-                amount = min(gap, 16384)
-                out.write(zero[:amount * 8]); gap -= amount
             asset = next((a for a in project["audio_assets"] if a["id"] == clip["asset"]), None)
             if not asset: raise EditorError("음원 파일 참조를 찾지 못했습니다.")
             source = pcm_paths.get(asset["id"])
             if not source or not Path(source).is_file():
                 raise EditorError("음원 분석 캐시가 없습니다. 음원을 다시 분석하세요.")
-            remaining = clip["source_out"] - clip["source_in"]
-            with Path(source).open("rb") as inp:
-                inp.seek(clip["source_in"] * 8)
-                while remaining:
-                    if cancel.is_set(): raise EditorError("작업을 취소했습니다.")
-                    raw = inp.read(min(remaining, 16384) * 8)
-                    if not raw: raise EditorError("음원 사용 구간이 원본 길이를 넘습니다. 다시 분석하세요.")
-                    out.write(raw); remaining -= len(raw) // 8
-            cursor = audio_end(clip)
-    return cursor
+            if clip["source_out"] > asset["samples"]:
+                raise EditorError("음원 사용 구간이 원본 길이를 넘습니다. 다시 분석하세요.")
+            if asset["id"] not in streams:
+                streams[asset["id"]] = stack.enter_context(Path(source).open("rb"))
+        final = duration_samples(project)
+        with Path(destination).open("wb") as out:
+            for cursor in range(0, final, 16384):
+                if cancel.is_set(): raise EditorError("작업을 취소했습니다.")
+                out.write(mixed_audio_chunk(clips, streams, cursor, min(16384, final-cursor)))
+    return final
+
+
+def mixed_audio_chunk(clips, streams, cursor, count):
+    """Mix interleaved stereo float32 PCM; clamp only the final sum."""
+    active = sorted(((max(cursor, audio_start(clip)), min(cursor + count, audio_end(clip)), clip)
+                     for clip in clips if audio_start(clip) < cursor + count and audio_end(clip) > cursor),
+                    key=lambda span: span[0])
+    latest = cursor
+    overlapping = False
+    for begin, end, _ in active:
+        if begin < latest:
+            overlapping = True
+            break
+        latest = max(latest, end)
+    output = array("f", [0.0]) * (count * 2) if overlapping else bytearray(count * 8)
+    for begin, end, clip in active:
+        source = streams[clip["asset"]]
+        source.seek((clip["source_in"] + begin - audio_start(clip)) * 8)
+        raw = source.read((end - begin) * 8)
+        if len(raw) != (end - begin) * 8:
+            raise EditorError("오디오 캐시가 짧습니다. 다시 분석하세요.")
+        if not overlapping:
+            output[(begin - cursor) * 8:(end - cursor) * 8] = raw
+            continue
+        samples = array("f")
+        samples.frombytes(raw)
+        offset = (begin - cursor) * 2
+        for index, value in enumerate(samples):
+            output[offset + index] += value
+    if overlapping:
+        for index, value in enumerate(output):
+            output[index] = max(-1.0, min(1.0, value))
+        return output.tobytes()
+    return bytes(output)
 
 
 def _run_encoder(command, cancel, progress=None, input_frames=None):

@@ -139,6 +139,11 @@ class EditorApp(BaseEditor):
                   style="PanelTitle.TLabel", wraplength=250).pack(anchor="w")
         self._prop_entry("시작 (초)", f"{item['start']/core.FPS:.3f}", "start_seconds")
         self._prop_entry("끝 (초)", f"{item['end']/core.FPS:.3f}", "end_seconds")
+        ttk.Label(self.properties, text="겹치는 이미지의 앞뒤 순서", style="Muted.TLabel").pack(anchor="w", pady=(8, 2))
+        layer_actions = ttk.Frame(self.properties, style="Panel.TFrame")
+        layer_actions.pack(fill="x")
+        ttk.Button(layer_actions, text="뒤로 보내기", command=lambda: self._move_image_layer(-1)).pack(side="left")
+        ttk.Button(layer_actions, text="앞으로 가져오기", command=lambda: self._move_image_layer(1)).pack(side="left", padx=4)
         ttk.Label(self.properties, text="화면 배치", style="PanelTitle.TLabel").pack(anchor="w", pady=(12, 4))
         ttk.Label(self.properties, text="미리보기에서 이미지를 끌어 이동하거나 모서리로 크기를 조절하세요.",
                   style="Muted.TLabel", wraplength=245).pack(anchor="w", pady=(0, 8))
@@ -215,12 +220,11 @@ class EditorApp(BaseEditor):
                 elif key == "source_in_seconds": trial["source_in"] = max(0, value)
                 elif key == "source_out_seconds": trial["source_out"] = min(asset.get("samples", 0), value)
                 else: return
-                if not core.valid_audio(self.project, trial, item["id"]): raise ValueError("음원끼리 겹치거나 사용 구간이 잘못되었습니다.")
+                if not core.valid_audio(self.project, trial, item["id"]): raise ValueError("음원 사용 구간이 잘못되었습니다.")
             else:
                 if key in ("start_seconds", "end_seconds"):
                     trial["start" if key == "start_seconds" else "end"] = max(0, round(float(raw) * core.FPS))
-                    if not core.valid_interval(self.project["images"], trial["start"], trial["end"], item["id"]):
-                        raise ValueError("이미지 클립이 겹치거나 길이가 0입니다.")
+                    if trial["end"] <= trial["start"]: raise ValueError("이미지 클립 길이는 0보다 커야 합니다.")
                 elif key in ("image_x", "image_y", "image_zoom"):
                     field = key[6:]
                     trial[self.motion_key.get()][field] = max(10, min(500, float(raw))) if field == "zoom" else float(raw)
@@ -262,6 +266,17 @@ class EditorApp(BaseEditor):
             trial["from"] = dict(state); trial["to"] = dict(state); trial["motion"] = False
         if trial != item:
             self._change(); item.update(trial); self._refresh()
+
+    def _move_image_layer(self, direction):
+        item = self._selected()
+        if not item or self.selection[0] != "image" or not self._editable(): return
+        images = self.project["images"]
+        index = images.index(item)
+        other = index + direction
+        if not 0 <= other < len(images): return
+        self._change()
+        images[index], images[other] = images[other], images[index]
+        self._refresh()
 
     def _image_wheel(self, event):
         item = self._selected()
@@ -376,22 +391,19 @@ class EditorApp(BaseEditor):
                 if asset and drag["id"] in self.audio_cache:
                     drag["trial"] = {"start_sample": round(frame*core.RATE/core.FPS),
                                      "source_in": 0, "source_out": asset["samples"]}
-                    drag["valid"] = drag["valid"] and core.valid_audio(self.project, drag["trial"] | {"id":""})
+                    drag["valid"] = drag["valid"] and core.valid_audio(self.project, drag["trial"])
                 else: drag["valid"] = False
             elif drag["kind"] == "image":
-                next_start=min((c["start"] for c in self.project["images"] if c["start"]>frame),
-                               default=core.total_frames(self.duration))
                 drag["trial"] = {"start": frame, "end": min(core.total_frames(self.duration),
-                                                             frame+150,next_start)}
-                drag["valid"] = drag["valid"] and core.valid_interval(self.project["images"],
-                                      drag["trial"]["start"],drag["trial"]["end"])
+                                                             frame+150)}
+                drag["valid"] = drag["valid"] and drag["trial"]["end"] > frame
             else:
                 drag["trial"] = {"start":frame,"end":min(core.total_frames(self.duration),frame+90)}
                 drag["valid"] = drag["valid"] and drag["trial"]["end"]>frame
         else: drag["valid"] = False
         if drag["active"]:
             self.status.set("놓을 수 있는 위치입니다." if drag["valid"] else
-                            "해당 트랙의 빈 구간에 놓으세요. 음원은 분석 완료 후 배치할 수 있습니다.")
+                            "해당 종류의 트랙에 놓으세요. 음원은 분석 완료 후 배치할 수 있습니다.")
             self._queue_drag_scroll()
         self.draw_timeline()
 
@@ -412,10 +424,7 @@ class EditorApp(BaseEditor):
     def place_asset(self, asset_id, frame):
         if not self._editable() or not self.duration: return
         start = max(0, int(frame)); end = min(core.total_frames(self.duration), start + 5 * core.FPS)
-        next_start = min((c["start"] for c in self.project["images"] if c["start"] > start), default=end)
-        end = min(end, next_start)
-        if not core.valid_interval(self.project["images"], start, end):
-            self.status.set("이미지 클립이 겹칩니다. 빈 구간에 놓으세요."); return
+        if end <= start: return
         self._commit_text_draft(); self._change()
         clip = core.image_defaults(asset_id, start, end)
         self.project["images"].append(clip)
@@ -429,8 +438,7 @@ class EditorApp(BaseEditor):
         clip = {"id": core.uid(), "asset": asset_id,
                 "start_sample": max(0, int(frame * core.RATE / core.FPS)),
                 "source_in": 0, "source_out": int(asset["samples"])}
-        if not core.valid_audio(self.project, clip):
-            self.status.set("음원 클립이 겹칩니다. 빈 구간에 놓으세요."); return
+        if not core.valid_audio(self.project, clip): return
         self._commit_text_draft(); self._change()
         self.project["audio_clips"].append(clip)
         self.selection = ("audio", clip["id"]); self._refresh()
@@ -471,7 +479,7 @@ class EditorApp(BaseEditor):
             duration = item["end"] - item["start"]
             trial["start"] = item["end"]; trial["end"] = item["end"] + duration
             collection = self.project["images"] if kind == "image" else self.project["texts"]
-            valid = kind == "text" or core.valid_interval(collection, trial["start"], trial["end"])
+            valid = trial["start"] >= 0 and trial["end"] > trial["start"]
             if kind == "text": trial["order"] = max((t.get("order",0) for t in collection), default=0)+1
         if not valid:
             self.status.set("복제할 빈 구간이 없습니다."); return
@@ -675,16 +683,39 @@ class EditorApp(BaseEditor):
         if y < self.audio_y + self.audio_track_height: return "audio"
         return None
 
+    @staticmethod
+    def _media_lanes(items, start, end, stacked=False):
+        lanes = []
+        ordered = items if stacked else sorted(items, key=start)
+        for item in ordered:
+            first = 0
+            if stacked:
+                first = max((index + 1 for index, lane in enumerate(lanes)
+                             if any(start(item) < end(other) and end(item) > start(other)
+                                    for other in lane)), default=0)
+            for lane in lanes[first:]:
+                if all(end(other) <= start(item) or start(other) >= end(item)
+                       for other in lane):
+                    lane.append(item)
+                    break
+            else:
+                lanes.append([item])
+        return lanes or [[]]
+
     def draw_timeline(self):
         c = self.timeline
         if not c.winfo_exists(): return
         c.delete("all")
         lanes = self._text_lanes()
         rows = max(1, len(lanes))
+        image_lanes = self._media_lanes(self.project["images"],
+                                        lambda clip: clip["start"], lambda clip: clip["end"], stacked=True)
+        audio_lanes = self._media_lanes(self.project["audio_clips"], core.audio_start, core.audio_end)
         self.image_y = 24 + rows * 42
-        self.audio_y = self.image_y + 58
-        height = max(c.winfo_height(), self.audio_y + 64)
+        self.audio_y = self.image_y + len(image_lanes) * 58
+        height = max(c.winfo_height(), self.audio_y + len(audio_lanes) * 64)
         self.audio_track_height = height - self.audio_y
+        self.audio_lane_height = self.audio_track_height / len(audio_lanes)
         latest = max([self.duration] + [i["end"] / core.FPS for i in self.project["images"]]
                      + [t["end"] / core.FPS for t in self.project["texts"]])
         for drag in (self.drag,self.library_drag):
@@ -701,7 +732,9 @@ class EditorApp(BaseEditor):
         if self.duration:
             c.create_rectangle(self.duration*self.zoom,24,full_w,height,
                                fill=UI_COLORS["outside"],outline="")
-        for y in [24] + [24+lane*42 for lane in range(1,rows)] + [self.image_y,self.audio_y]:
+        for y in ([24] + [24+lane*42 for lane in range(1,rows)]
+                  + [self.image_y+lane*58 for lane in range(len(image_lanes))]
+                  + [self.audio_y+lane*self.audio_lane_height for lane in range(len(audio_lanes))]):
             c.create_line(0,y,full_w,y,fill=UI_COLORS["track_divider"])
         header=self.track_header
         header.delete("all"); header.configure(scrollregion=(0,0,self.track_header_width,height))
@@ -712,10 +745,14 @@ class EditorApp(BaseEditor):
             y0=24+lane*42
             self._draw_track_header(y0,y0+42,UI_COLORS["text_clip_top"],
                                     f"텍스트 {lane+1}",len(items))
-        self._draw_track_header(self.image_y,self.audio_y,UI_COLORS["image_clip_top"],
-                                "이미지",len(self.project["images"]))
-        self._draw_track_header(self.audio_y,height,UI_COLORS["audio_clip_top"],
-                                "음악",len(self.project["audio_clips"]))
+        for lane, items in enumerate(image_lanes):
+            top=self.image_y+(len(image_lanes)-1-lane)*58
+            self._draw_track_header(top,top+58,UI_COLORS["image_clip_top"],
+                                    f"이미지 {lane+1}",len(items))
+        for lane, items in enumerate(audio_lanes):
+            top=self.audio_y+lane*self.audio_lane_height
+            self._draw_track_header(top,top+self.audio_lane_height,UI_COLORS["audio_clip_top"],
+                                    f"음악 {lane+1}",len(items))
         header.create_line(self.track_header_width-1,0,self.track_header_width-1,height,
                            fill=UI_COLORS["track_divider"])
         self.track_header.yview_moveto(c.yview()[0])
@@ -755,39 +792,43 @@ class EditorApp(BaseEditor):
         for lane, items in enumerate(lanes):
             for item in items:
                 self._draw_clip(item,"text",27+lane*42,34,UI_COLORS["text_clip"],item["text"].replace("\n"," "))
-        for clip in self.project["images"]:
-            asset = next((a for a in self.project["assets"] if a["id"] == clip["asset"]), None)
-            name = Path(asset["path"]).name if asset else "누락"
-            self._draw_clip(clip,"image",self.image_y+6,46,UI_COLORS["image_clip"],name,
-                            asset["path"] if asset else None)
-            effect,length,previous = core.transition_info(self.project,clip)
-            if clip.get("transition",{}).get("type") != "cut":
-                x0 = self._frame_x(clip["start"])
-                x1 = self._frame_x(clip["start"] + min(clip["transition"]["frames"],clip["end"]-clip["start"]))
-                c.create_rectangle(x0,self.image_y+6,x1,self.image_y+19,
-                                   fill="#a67832" if effect != "cut" else "#654b37",outline="",
-                                   tags=("transition",clip["id"]))
-                if x1-x0 > 26:
-                    c.create_text(x0+3,self.image_y+12,text=clip["transition"]["type"],
-                                  anchor="w",fill="white",tags=("transition",clip["id"]))
-        for clip in self.project["audio_clips"]:
-            asset = next((a for a in self.project["audio_assets"] if a["id"] == clip["asset"]), None)
-            label = Path(asset["path"]).name if asset else "누락"
-            self._draw_clip(clip,"audio",self.audio_y+6,self.audio_track_height-12,UI_COLORS["audio_clip"],label)
-            cache = self.audio_cache.get(clip["asset"])
-            if cache:
-                bins = cache["bins"]
-                x0 = core.audio_start(clip)/core.RATE*self.zoom
-                x1 = core.audio_end(clip)/core.RATE*self.zoom
-                center = self.audio_y+self.audio_track_height/2+8
-                amplitude = min(40,max(15,(self.audio_track_height-44)/2))
-                for px in range(max(int(left),int(x0)+8), min(int(right),int(x1)-8), 2):
-                    source_s = clip["source_in"]/core.RATE+(px-x0)/self.zoom
-                    idx = int(source_s*100)
-                    if 0 <= idx < len(bins):
-                        peak = min(1,bins[idx])
-                        c.create_line(px,center-peak*amplitude,px,center+peak*amplitude,
-                                      fill=UI_COLORS["waveform"],tags=("audio",clip["id"]))
+        for lane, items in enumerate(image_lanes):
+            y=self.image_y+(len(image_lanes)-1-lane)*58
+            for clip in items:
+                asset = next((a for a in self.project["assets"] if a["id"] == clip["asset"]), None)
+                name = Path(asset["path"]).name if asset else "누락"
+                self._draw_clip(clip,"image",y+6,46,UI_COLORS["image_clip"],name,
+                                asset["path"] if asset else None)
+                effect,length,previous = core.transition_info(self.project,clip)
+                if clip.get("transition",{}).get("type") != "cut":
+                    x0 = self._frame_x(clip["start"])
+                    x1 = self._frame_x(clip["start"] + min(clip["transition"]["frames"],clip["end"]-clip["start"]))
+                    c.create_rectangle(x0,y+6,x1,y+19,
+                                       fill="#a67832" if effect != "cut" else "#654b37",outline="",
+                                       tags=("transition",clip["id"]))
+                    if x1-x0 > 26:
+                        c.create_text(x0+3,y+12,text=clip["transition"]["type"],
+                                      anchor="w",fill="white",tags=("transition",clip["id"]))
+        for lane, items in enumerate(audio_lanes):
+            y=self.audio_y+lane*self.audio_lane_height
+            for clip in items:
+                asset = next((a for a in self.project["audio_assets"] if a["id"] == clip["asset"]), None)
+                label = Path(asset["path"]).name if asset else "누락"
+                self._draw_clip(clip,"audio",y+6,self.audio_lane_height-12,UI_COLORS["audio_clip"],label)
+                cache = self.audio_cache.get(clip["asset"])
+                if cache:
+                    bins = cache["bins"]
+                    x0 = core.audio_start(clip)/core.RATE*self.zoom
+                    x1 = core.audio_end(clip)/core.RATE*self.zoom
+                    center = y+self.audio_lane_height/2+8
+                    amplitude = min(40,max(15,(self.audio_lane_height-44)/2))
+                    for px in range(max(int(left),int(x0)+8), min(int(right),int(x1)-8), 2):
+                        source_s = clip["source_in"]/core.RATE+(px-x0)/self.zoom
+                        idx = int(source_s*100)
+                        if 0 <= idx < len(bins):
+                            peak = min(1,bins[idx])
+                            c.create_line(px,center-peak*amplitude,px,center+peak*amplitude,
+                                          fill=UI_COLORS["waveform"],tags=("audio",clip["id"]))
         drag = self.drag or self.library_drag
         if drag and drag.get("active") and drag.get("trial"):
             trial = drag["trial"]; kind = drag["kind"]
@@ -1024,15 +1065,13 @@ class EditorApp(BaseEditor):
                 trial["transition"]["frames"]=max(1,min(origin["end"]-origin["start"],
                                                           origin["transition"]["frames"]+delta))
             valid_time = trial["start"]>=0 and trial["end"]>trial["start"]
-            valid_overlap = drag["kind"]=="text" or core.valid_interval(self.project["images"],
-                                                trial["start"],trial["end"],origin["id"])
-            drag["valid"]=self._track_at(c.canvasy(event.y))==drag["kind"] and valid_time and valid_overlap
+            drag["valid"]=self._track_at(c.canvasy(event.y))==drag["kind"] and valid_time
         drag["trial"]=trial
         if drag["kind"]=="audio":
             begin,end=core.audio_start(trial)/core.RATE,core.audio_end(trial)/core.RATE
         else: begin,end=trial["start"]/core.FPS,trial["end"]/core.FPS
         self.status.set((f"{clock(begin)} → {clock(end)}  ·  길이 {clock(end-begin)}" if drag["valid"]
-                         else "놓을 수 없습니다. 트랙 위치, 클립 겹침과 길이를 확인하세요."))
+                         else "놓을 수 없습니다. 트랙 위치와 클립 길이를 확인하세요."))
         self._queue_drag_scroll()
         self.draw_timeline()
 
@@ -1062,7 +1101,8 @@ class EditorApp(BaseEditor):
         try:
             cue=core.active_image(self.project,frame)
             self.preview_context.configure(text="이미지 없음 · 검은 화면" if self.duration and cue is None else "")
-            key=(frame if core.dynamic_frame(self.project,frame) else cue["id"] if cue else None,
+            key=(frame if core.dynamic_frame(self.project,frame) else
+                 tuple(c["id"] for c in core.active_images(self.project,frame)),
                  tuple(t["id"] for t in self.project["texts"] if t["start"]<=frame<t["end"]),
                  width,height,self.revision)
             if key!=self.scene_cache_key or self.preview_ref is None:
@@ -1080,7 +1120,7 @@ class EditorApp(BaseEditor):
                     hy=y+(t+b)*scale/2
                     self.preview.create_rectangle(hx-5,hy-5,hx+5,hy+5,
                                                   fill=UI_COLORS["primary"],outline="#ffffff")
-            if item and self.selection[0]=="image" and cue and cue["id"]==item["id"]:
+            if item and self.selection[0]=="image" and item["start"]<=frame<item["end"]:
                 state=core.transform_at(item,frame)
                 cx,cy=x+state["x"]*scale,y+state["y"]*scale
                 try: bounds=core.image_bounds(self.project,item,frame)
@@ -1119,8 +1159,14 @@ class EditorApp(BaseEditor):
                 if abs(px-(x+r*w/1920))<=10: return "text",selected,"width_right"
         text=self._preview_hit(px,py)
         if text: return "text",text,"move"
-        cue=core.active_image(self.project,frame)
-        if cue:
+        selected_image = (selected if selected and self.selection[0]=="image"
+                          and selected["start"]<=frame<selected["end"] else None)
+        cues = core.active_images(self.project,frame)
+        if selected_image:
+            cues = [selected_image] + [cue for cue in reversed(cues) if cue is not selected_image]
+        else:
+            cues = list(reversed(cues))
+        for cue in cues:
             try: bounds=core.image_bounds(self.project,cue,frame)
             except (OSError,ValueError): bounds=None
             if bounds:
@@ -1225,7 +1271,7 @@ class EditorApp(BaseEditor):
         self.playing=True; self.play_button.configure(text="Ⅱ 일시정지")
         start_sample=min(core.duration_samples(self.project),round(self.position*core.RATE))
         self.play_epoch=start_sample/core.RATE
-        clips=sorted(copy.deepcopy(self.project["audio_clips"]),key=core.audio_start)
+        clips=copy.deepcopy(self.project["audio_clips"])
         paths={key:value["pcm"] for key,value in self.audio_cache.items()}
         final=core.duration_samples(self.project)
         def worker():
@@ -1240,16 +1286,8 @@ class EditorApp(BaseEditor):
                     self.play_latency=stream.latency
                     cursor=start_sample
                     while cursor<final and not cancel.is_set():
-                        clip=next((c for c in clips if core.audio_start(c)<=cursor<core.audio_end(c)),None)
-                        if clip:
-                            count=min(2048,core.audio_end(clip)-cursor)
-                            source_index=clip["source_in"]+cursor-core.audio_start(clip)
-                            source=streams[clip["asset"]]
-                            source.seek(source_index*8); raw=source.read(count*8)
-                            if len(raw)<count*8: raise core.EditorError("오디오 캐시가 짧습니다. 다시 분석하세요.")
-                        else:
-                            next_start=min((core.audio_start(c) for c in clips if core.audio_start(c)>cursor),default=final)
-                            count=min(2048,next_start-cursor); raw=bytes(count*8)
+                        count=min(2048,final-cursor)
+                        raw=core.mixed_audio_chunk(clips,streams,cursor,count)
                         stream.write(raw)
                         cursor+=count; self.play_frames+=count
                 if not cancel.is_set(): self.events.put(("play_end",))
