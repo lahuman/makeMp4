@@ -11,10 +11,10 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from types import SimpleNamespace
 
-from PIL import ImageTk
+from PIL import Image, ImageOps, ImageTk
 
 import editor_core as core
-from editor_ui import EditorApp as BaseEditor, clock
+from editor_ui import EditorApp as BaseEditor, UI_COLORS, clock
 
 
 class EditorApp(BaseEditor):
@@ -37,8 +37,8 @@ class EditorApp(BaseEditor):
         self.audio_list.pack(fill="x", after=self.audio_info, padx=8, pady=(0, 5))
         self.audio_rows = {}
         self.text_source = ttk.Label(self.timeline.master.master.master.winfo_children()[0],
-                                     text="▣ 새 텍스트  ↘", cursor="hand2")
-        self.text_source.pack(side="left", padx=6)
+                                     text="텍스트 끌어놓기 ↘", style="Source.TLabel", cursor="hand2")
+        self.text_source.pack(side="left", padx=8)
         self.text_source.bind("<ButtonPress-1>", lambda e: self._library_start("text", None, e))
         self.preview.bind("<Alt-MouseWheel>", self._image_wheel)
         self.preview.bind("<Motion>", self._preview_hover)
@@ -110,7 +110,10 @@ class EditorApp(BaseEditor):
         parent = parent or self.properties
         ttk.Label(parent, text="문구 (여러 줄)").pack(anchor="w")
         box = tk.Text(parent, height=4, wrap="word", font=("Malgun Gothic", 10),
-                      bg="#30333a", fg="#e8eaed", insertbackground="white", relief="flat")
+                      bg=UI_COLORS["surface"], fg=UI_COLORS["text"],
+                      insertbackground=UI_COLORS["text"], relief="solid", bd=1,
+                      highlightthickness=1, highlightbackground=UI_COLORS["border"],
+                      highlightcolor=UI_COLORS["primary"])
         box.insert("1.0", item["text"]); box.pack(fill="x")
         self.text_draft = (item["id"], box)
         box.bind("<FocusOut>", lambda e: self.root.after_idle(self._commit_text_draft))
@@ -136,28 +139,38 @@ class EditorApp(BaseEditor):
                   style="PanelTitle.TLabel", wraplength=250).pack(anchor="w")
         self._prop_entry("시작 (초)", f"{item['start']/core.FPS:.3f}", "start_seconds")
         self._prop_entry("끝 (초)", f"{item['end']/core.FPS:.3f}", "end_seconds")
+        ttk.Label(self.properties, text="화면 배치", style="PanelTitle.TLabel").pack(anchor="w", pady=(12, 4))
         ttk.Label(self.properties, text="미리보기에서 이미지를 끌어 이동하거나 모서리로 크기를 조절하세요.",
-                  style="Muted.TLabel", wraplength=245).pack(anchor="w", pady=5)
-        ttk.Button(self.properties, text="화면 맞춤", command=lambda: self._image_preset("fit")).pack(fill="x")
-        ttk.Button(self.properties, text="화면 채움", command=lambda: self._image_preset("fill")).pack(fill="x")
-        ttk.Button(self.properties, text="가운데 정렬", command=lambda: self._image_preset("center")).pack(fill="x")
-        ttk.Button(self.properties, text="초기화", command=lambda: self._image_preset("reset")).pack(fill="x")
+                  style="Muted.TLabel", wraplength=245).pack(anchor="w", pady=(0, 8))
+        presets = ttk.Frame(self.properties, style="Panel.TFrame")
+        presets.pack(fill="x")
+        for index, (label, preset) in enumerate((("화면 맞춤", "fit"), ("화면 채움", "fill"),
+                                                  ("가운데 정렬", "center"), ("초기화", "reset"))):
+            ttk.Button(presets, text=label, command=lambda name=preset: self._image_preset(name)).grid(
+                row=index//2, column=index%2, sticky="ew", padx=(0, 4) if index%2 == 0 else (4, 0), pady=4)
+        presets.columnconfigure(0, weight=1)
+        presets.columnconfigure(1, weight=1)
         motion = tk.BooleanVar(value=item.get("motion", False))
         ttk.Checkbutton(self.properties, text="시작→끝 움직임", variable=motion,
                         command=lambda: self._commit("motion", motion.get(), item["id"])).pack(anchor="w", pady=5)
         ttk.Label(self.properties, text="편집할 상태").pack(anchor="w")
-        state_combo = ttk.Combobox(self.properties, values=("from", "to"), textvariable=self.motion_key,
+        state_labels = {"from": "시작 상태", "to": "끝 상태"}
+        selected_state = tk.StringVar(value=state_labels[self.motion_key.get()])
+        state_combo = ttk.Combobox(self.properties, values=tuple(state_labels.values()), textvariable=selected_state,
                                    state="readonly")
         state_combo.pack(fill="x")
-        state_combo.bind("<<ComboboxSelected>>", lambda e: self._show_properties())
+        state_combo.bind("<<ComboboxSelected>>", lambda e: (self.motion_key.set(
+            next(key for key, label in state_labels.items() if label == selected_state.get())), self._show_properties()))
         state = item[self.motion_key.get()]
         for label, key in (("가로 중심", "image_x"), ("세로 중심", "image_y"), ("배율 %", "image_zoom")):
             self._prop_entry(label, str(round(state[key[6:]])), key)
         ttk.Label(self.properties, text="움직임 속도").pack(anchor="w", pady=(6, 0))
-        ease = tk.StringVar(value=item.get("easing", "smooth"))
-        combo = ttk.Combobox(self.properties, values=("smooth", "linear"), textvariable=ease, state="readonly")
+        easing_labels = {"smooth": "부드럽게", "linear": "일정하게"}
+        ease = tk.StringVar(value=easing_labels[item.get("easing", "smooth")])
+        combo = ttk.Combobox(self.properties, values=tuple(easing_labels.values()), textvariable=ease, state="readonly")
         combo.pack(fill="x")
-        combo.bind("<<ComboboxSelected>>", lambda e: self._commit("easing", ease.get(), item["id"]))
+        combo.bind("<<ComboboxSelected>>", lambda e: self._commit("easing",
+                   next(key for key, label in easing_labels.items() if label == ease.get()), item["id"]))
         ttk.Label(self.properties, text="이미지 전환").pack(anchor="w", pady=(6, 0))
         effects = {"cut":"즉시 전환", "dissolve":"크로스 디졸브", "fade_black":"검정 페이드", "slide":"좌우 슬라이드"}
         current = tk.StringVar(value=effects.get(item.get("transition", {}).get("type", "cut"), "즉시 전환"))
@@ -541,6 +554,7 @@ class EditorApp(BaseEditor):
         dialog=tk.Toplevel(self.root)
         dialog.title("전체 구성")
         dialog.geometry("780x480")
+        dialog.configure(bg=UI_COLORS["surface"])
         dialog.transient(self.root)
         self.composition_dialog=dialog
         body=ttk.Frame(dialog, style="Panel.TFrame", padding=12)
@@ -556,8 +570,8 @@ class EditorApp(BaseEditor):
                                 ("end","끝",100),("note","상태",150)):
             table.heading(key,text=title)
             table.column(key,width=width,stretch=key=="name")
-        table.tag_configure("gap", foreground="#cfaa77")
-        table.tag_configure("outside", foreground="#e47777")
+        table.tag_configure("gap", foreground="#926300")
+        table.tag_configure("outside", foreground="#B91C1C")
         scroll=ttk.Scrollbar(table_wrap, orient="vertical", command=table.yview)
         table.configure(yscrollcommand=scroll.set)
         table.pack(side="left",fill="both",expand=True)
@@ -569,7 +583,8 @@ class EditorApp(BaseEditor):
         actions.pack(fill="x", pady=(10, 0))
         ttk.Button(actions, text="위치로 이동", command=self._jump_to_composition).pack(side="left")
         ttk.Button(actions, text="선택 복제", command=lambda: self._composition_edit("duplicate")).pack(side="left", padx=6)
-        ttk.Button(actions, text="선택 삭제", command=lambda: self._composition_edit("delete")).pack(side="left")
+        ttk.Button(actions, text="선택 삭제", style="Danger.TButton",
+                   command=lambda: self._composition_edit("delete")).pack(side="left")
         ttk.Button(actions, text="전체 맞춤", command=self.fit_zoom).pack(side="right")
         dialog.protocol("WM_DELETE_WINDOW", lambda: (dialog.destroy(), setattr(self,"composition_dialog",None)))
         self._refresh_composition()
@@ -657,7 +672,7 @@ class EditorApp(BaseEditor):
         if y < 24: return "seek"
         if y < self.image_y: return "text"
         if y < self.audio_y: return "image"
-        if y < self.audio_y + 64: return "audio"
+        if y < self.audio_y + self.audio_track_height: return "audio"
         return None
 
     def draw_timeline(self):
@@ -669,6 +684,7 @@ class EditorApp(BaseEditor):
         self.image_y = 24 + rows * 42
         self.audio_y = self.image_y + 58
         height = max(c.winfo_height(), self.audio_y + 64)
+        self.audio_track_height = height - self.audio_y
         latest = max([self.duration] + [i["end"] / core.FPS for i in self.project["images"]]
                      + [t["end"] / core.FPS for t in self.project["texts"]])
         for drag in (self.drag,self.library_drag):
@@ -678,44 +694,72 @@ class EditorApp(BaseEditor):
                                    else trial["end"]/core.FPS))
         full_w = max(c.winfo_width(), 8 + (latest + 10) * self.zoom)
         c.configure(scrollregion=(0, 0, full_w, height))
-        for y0,y1,color in ((0,24,"#29313b"),(24,self.image_y,"#24262d"),
-                            (self.image_y,self.audio_y,"#272a32"),(self.audio_y,height,"#242a30")):
+        for y0,y1,color in ((0,24,UI_COLORS["ruler"]),(24,self.image_y,UI_COLORS["track_text"]),
+                            (self.image_y,self.audio_y,UI_COLORS["track_image"]),
+                            (self.audio_y,height,UI_COLORS["track_audio"])):
             c.create_rectangle(0,y0,full_w,y1,fill=color,outline="")
-        self.track_header.delete("all"); self.track_header.configure(scrollregion=(0,0,76,height))
-        for lane in range(rows):
-            self.track_header.create_text(8,45+lane*42,text=f"텍스트 {lane+1}",anchor="w",fill="#d6d6d6")
-        for y,label in ((self.image_y+29,"이미지"),(self.audio_y+31,"음악")):
-            self.track_header.create_text(8,y,text=label,anchor="w",fill="#d6d6d6")
+        if self.duration:
+            c.create_rectangle(self.duration*self.zoom,24,full_w,height,
+                               fill=UI_COLORS["outside"],outline="")
+        for y in [24] + [24+lane*42 for lane in range(1,rows)] + [self.image_y,self.audio_y]:
+            c.create_line(0,y,full_w,y,fill=UI_COLORS["track_divider"])
+        header=self.track_header
+        header.delete("all"); header.configure(scrollregion=(0,0,self.track_header_width,height))
+        header.create_rectangle(0,0,self.track_header_width,24,fill=UI_COLORS["ruler"],outline="")
+        header.create_text(12,12,text="시간",anchor="w",fill=UI_COLORS["timeline_muted"],
+                           font=("Malgun Gothic",8,"bold"))
+        for lane,items in enumerate(lanes):
+            y0=24+lane*42
+            self._draw_track_header(y0,y0+42,UI_COLORS["text_clip_top"],
+                                    f"텍스트 {lane+1}",len(items))
+        self._draw_track_header(self.image_y,self.audio_y,UI_COLORS["image_clip_top"],
+                                "이미지",len(self.project["images"]))
+        self._draw_track_header(self.audio_y,height,UI_COLORS["audio_clip_top"],
+                                "음악",len(self.project["audio_clips"]))
+        header.create_line(self.track_header_width-1,0,self.track_header_width-1,height,
+                           fill=UI_COLORS["track_divider"])
         self.track_header.yview_moveto(c.yview()[0])
         left,right = max(0,c.canvasx(0)),c.canvasx(c.winfo_width())
         for kind,intervals,y0,y1,label in (
             ("image",((i["start"]/core.FPS,i["end"]/core.FPS) for i in self.project["images"]),
              self.image_y+6,self.image_y+52,"검은 화면"),
             ("audio",((core.audio_start(i)/core.RATE,core.audio_end(i)/core.RATE)
-                      for i in self.project["audio_clips"]),self.audio_y+6,self.audio_y+56,"무음")):
+                      for i in self.project["audio_clips"]),self.audio_y+6,height-6,"무음")):
             for start,end in self._interval_gaps(intervals,self.duration):
                 x0,x1=start*self.zoom,end*self.zoom
                 if x1<left or x0>right: continue
-                c.create_rectangle(x0,y0,x1,y1,fill="#35333a" if kind=="image" else "#303a3a",
-                                   outline="#6e5960" if kind=="image" else "#526764",dash=(3,3))
+                c.create_rectangle(x0,y0,x1,y1,
+                                   fill=UI_COLORS["gap_image"] if kind=="image" else UI_COLORS["gap_audio"],
+                                   outline="")
+                c.create_line(x0,y0,x1,y0,fill=UI_COLORS["track_divider"],dash=(4,4))
                 if x1-x0>70:
-                    c.create_text(x0+6,(y0+y1)/2,text=label,anchor="w",fill="#bca9a8")
+                    c.create_text(x0+6,(y0+y1)/2,text=label,anchor="w",
+                                  fill="#92400E" if kind=="image" else UI_COLORS["timeline_muted"])
         step = next((s for s in (1,2,5,10,30,60,300,600) if s*self.zoom >= 70),1800)
+        minor=step/4 if step*self.zoom/4>=16 else step/2
+        sec=math.floor(left/self.zoom/minor)*minor
+        while sec*self.zoom<=right+minor*self.zoom:
+            if abs(sec/step-round(sec/step))>1e-6:
+                x=sec*self.zoom
+                c.create_line(x,18,x,23,fill=UI_COLORS["timeline_muted"])
+            sec+=minor
         for sec in range(max(0,int(left/self.zoom/step)*step), int(right/self.zoom)+step,step):
             x = sec*self.zoom
-            c.create_line(x,16,x,height,fill="#41464d")
-            c.create_text(x+3,9,text=clock(sec)[:5],anchor="w",fill="#b8bdc5")
+            c.create_line(x,16,x,height,fill=UI_COLORS["grid"])
+            c.create_text(x+5,9,text=clock(sec)[:5],anchor="w",fill=UI_COLORS["timeline_text"],
+                          font=("Consolas",8))
         if self.duration:
             x = self.duration*self.zoom
-            c.create_line(x,24,x,height,fill="#ed6868",dash=(3,3))
-            c.create_text(x+4,25,text="영상 끝",anchor="nw",fill="#ed6868")
+            c.create_line(x,24,x,height,fill=UI_COLORS["error"],dash=(3,3))
+            c.create_text(x+4,25,text="영상 끝",anchor="nw",fill=UI_COLORS["error"])
         for lane, items in enumerate(lanes):
             for item in items:
-                self._draw_clip(item,"text",27+lane*42,34,"#604866",item["text"].replace("\n"," "))
+                self._draw_clip(item,"text",27+lane*42,34,UI_COLORS["text_clip"],item["text"].replace("\n"," "))
         for clip in self.project["images"]:
             asset = next((a for a in self.project["assets"] if a["id"] == clip["asset"]), None)
             name = Path(asset["path"]).name if asset else "누락"
-            self._draw_clip(clip,"image",self.image_y+6,46,"#345d81",name)
+            self._draw_clip(clip,"image",self.image_y+6,46,UI_COLORS["image_clip"],name,
+                            asset["path"] if asset else None)
             effect,length,previous = core.transition_info(self.project,clip)
             if clip.get("transition",{}).get("type") != "cut":
                 x0 = self._frame_x(clip["start"])
@@ -729,19 +773,21 @@ class EditorApp(BaseEditor):
         for clip in self.project["audio_clips"]:
             asset = next((a for a in self.project["audio_assets"] if a["id"] == clip["asset"]), None)
             label = Path(asset["path"]).name if asset else "누락"
-            self._draw_clip(clip,"audio",self.audio_y+6,50,"#206b60",label)
+            self._draw_clip(clip,"audio",self.audio_y+6,self.audio_track_height-12,UI_COLORS["audio_clip"],label)
             cache = self.audio_cache.get(clip["asset"])
             if cache:
                 bins = cache["bins"]
                 x0 = core.audio_start(clip)/core.RATE*self.zoom
                 x1 = core.audio_end(clip)/core.RATE*self.zoom
-                for px in range(max(int(left),int(x0)), min(int(right),int(x1)), 2):
+                center = self.audio_y+self.audio_track_height/2+8
+                amplitude = min(40,max(15,(self.audio_track_height-44)/2))
+                for px in range(max(int(left),int(x0)+8), min(int(right),int(x1)-8), 2):
                     source_s = clip["source_in"]/core.RATE+(px-x0)/self.zoom
                     idx = int(source_s*100)
                     if 0 <= idx < len(bins):
                         peak = min(1,bins[idx])
-                        c.create_line(px,self.audio_y+31-peak*15,px,self.audio_y+31+peak*15,
-                                      fill="#69d7b5",tags=("audio",clip["id"]))
+                        c.create_line(px,center-peak*amplitude,px,center+peak*amplitude,
+                                      fill=UI_COLORS["waveform"],tags=("audio",clip["id"]))
         drag = self.drag or self.library_drag
         if drag and drag.get("active") and drag.get("trial"):
             trial = drag["trial"]; kind = drag["kind"]
@@ -749,8 +795,8 @@ class EditorApp(BaseEditor):
             else: a,b = trial["start"]/core.FPS,trial["end"]/core.FPS
             y = {"text":30,"image":self.image_y+9,"audio":self.audio_y+9}[kind]
             track_top,track_bottom={"text":(24,self.image_y),"image":(self.image_y,self.audio_y),
-                                    "audio":(self.audio_y,self.audio_y+64)}[kind]
-            c.create_rectangle(left,track_top,right,track_bottom,outline="#63dcae" if drag.get("valid") else "#e47777",
+                                    "audio":(self.audio_y,height)}[kind]
+            c.create_rectangle(left,track_top,right,track_bottom,outline=UI_COLORS["success"] if drag.get("valid") else UI_COLORS["error"],
                                width=2)
             c.create_rectangle(a*self.zoom,y,b*self.zoom,y+28,fill="#4a9970" if drag.get("valid") else "#a24141",
                                stipple="gray25",outline="white",width=2)
@@ -758,8 +804,20 @@ class EditorApp(BaseEditor):
                           anchor="sw",fill="white")
         x=self._frame_x(round(self.position*core.FPS))
         self.playhead_height=height
-        self.playhead_line=c.create_line(x,16,x,height,fill="#ffb34d",width=2,tags=("playhead",))
-        self.playhead_marker=c.create_polygon(x-6,16,x+6,16,x,27,fill="#ffb34d",tags=("playhead",))
+        self.playhead_line=c.create_line(x,16,x,height,fill=UI_COLORS["playhead"],width=2,tags=("playhead",))
+        self.playhead_marker=c.create_polygon(x-6,16,x+6,16,x,27,fill=UI_COLORS["playhead"],tags=("playhead",))
+
+    def _draw_track_header(self, top, bottom, accent, label, count):
+        c=self.track_header
+        middle=(top+bottom)/2
+        c.create_rectangle(0,top,self.track_header_width,bottom,
+                           fill=UI_COLORS["track_header"],outline="")
+        c.create_rectangle(0,top+8,3,bottom-8,fill=accent,outline="")
+        c.create_text(12,middle-8,text=label,anchor="w",fill=UI_COLORS["timeline_text"],
+                      font=("Malgun Gothic",9,"bold"))
+        c.create_text(12,middle+9,text=f"{count}개 클립",anchor="w",fill=UI_COLORS["timeline_muted"],
+                      font=("Malgun Gothic",8))
+        c.create_line(0,bottom,self.track_header_width,bottom,fill=UI_COLORS["track_divider"])
 
     def _timeline_hover(self,event):
         if self.drag or self.library_drag: return
@@ -779,23 +837,49 @@ class EditorApp(BaseEditor):
                 break
         if str(c.cget("cursor"))!=cursor: c.configure(cursor=cursor)
 
-    def _draw_clip(self, item, kind, y, h, color, label):
+    def _draw_clip(self, item, kind, y, h, color, label, thumbnail=None):
         c = self.timeline
         if kind == "audio": start,end=core.audio_start(item)/core.RATE,core.audio_end(item)/core.RATE
         else: start,end=item["start"]/core.FPS,item["end"]/core.FPS
         x0,x1=start*self.zoom,end*self.zoom
         if x1 < c.canvasx(0) or x0 > c.canvasx(c.winfo_width()): return
+        visible_left=max(x0,c.canvasx(0))
         selected = self.selection == (kind,item["id"])
-        c.create_rectangle(x0,y,x1,y+h,fill="#5682a9" if selected else color,
-                           outline="#fff4d1" if selected else "#7896a9",width=2 if selected else 1,
+        c.create_rectangle(x0,y,x1,y+h,fill=color,
+                           outline=UI_COLORS["primary"] if selected else UI_COLORS["clip_border"],
+                           width=3 if selected else 1,
                            tags=(kind,item["id"]))
-        if x1-x0 > 18:
-            c.create_line(x0+5,y+5,x0+5,y+h-5,fill="#d6eaf2",width=2,tags=(kind,item["id"]))
-            c.create_line(x1-5,y+5,x1-5,y+h-5,fill="#d6eaf2",width=2,tags=(kind,item["id"]))
-        if x1-x0 > 36:
-            chars=max(1,int((x1-x0-18)/7))
-            c.create_text(x0+10,y+h/2,text=label[:chars-1]+"…" if len(label)>chars else label,
-                          anchor="w",fill="white",tags=(kind,item["id"]))
+        if x1-x0 > 8:
+            c.create_rectangle(x0+3,y+3,x1-3,y+6,
+                               fill=UI_COLORS[f"{kind}_clip_top"],outline="",tags=(kind,item["id"]))
+        label_x=visible_left+10
+        if thumbnail and x1-visible_left > 110:
+            try:
+                path=Path(thumbnail)
+                key=(str(path),path.stat().st_mtime_ns,"timeline-v2")
+                photo=self.timeline_thumbnail_cache.get(key)
+                if photo is None:
+                    with Image.open(path) as source:
+                        frame_image=ImageOps.exif_transpose(source).convert("RGB")
+                        frame_image.thumbnail((42,30))
+                        photo=ImageTk.PhotoImage(frame_image,master=self.root)
+                    if len(self.timeline_thumbnail_cache)>180: self.timeline_thumbnail_cache.clear()
+                    self.timeline_thumbnail_cache[key]=photo
+                c.create_image(visible_left+8,y+h/2,anchor="w",image=photo,tags=(kind,item["id"]))
+                label_x=visible_left+56
+            except (OSError,ValueError):
+                pass
+        if selected and x1-x0 > 18:
+            middle=y+h/2
+            for handle_x in (x0+5,x1-5):
+                c.create_line(handle_x,middle-10,handle_x,middle+10,
+                              fill=UI_COLORS["primary"],width=2,tags=(kind,item["id"]))
+        if x1-label_x > 26:
+            chars=max(1,int((x1-label_x-8)/7))
+            c.create_text(label_x,y+10 if kind=="audio" else y+h/2,
+                          text=label[:chars-1]+"…" if len(label)>chars else label,
+                          anchor="nw" if kind=="audio" else "w",fill=UI_COLORS["timeline_text"],
+                          font=("Malgun Gothic",9,"bold"),tags=(kind,item["id"]))
 
     def _snap_frame(self, value, kind, ident, alt=False):
         value=max(0,int(value))
@@ -977,6 +1061,7 @@ class EditorApp(BaseEditor):
         frame=max(0,round(self.position*core.FPS))
         try:
             cue=core.active_image(self.project,frame)
+            self.preview_context.configure(text="이미지 없음 · 검은 화면" if self.duration and cue is None else "")
             key=(frame if core.dynamic_frame(self.project,frame) else cue["id"] if cue else None,
                  tuple(t["id"] for t in self.project["texts"] if t["start"]<=frame<t["end"]),
                  width,height,self.revision)
@@ -990,11 +1075,11 @@ class EditorApp(BaseEditor):
             if item and self.selection[0]=="text" and item["start"]<=frame<item["end"]:
                 l,t,r,b=core.text_box(item)
                 self.preview.create_rectangle(x+l*scale,y+t*scale,x+r*scale,y+b*scale,
-                                              outline="#00d6ff",width=2)
+                                              outline=UI_COLORS["primary"],width=2)
                 for hx in (x+l*scale, x+r*scale):
                     hy=y+(t+b)*scale/2
                     self.preview.create_rectangle(hx-5,hy-5,hx+5,hy+5,
-                                                  fill="#00d6ff",outline="#ffffff")
+                                                  fill=UI_COLORS["primary"],outline="#ffffff")
             if item and self.selection[0]=="image" and cue and cue["id"]==item["id"]:
                 state=core.transform_at(item,frame)
                 cx,cy=x+state["x"]*scale,y+state["y"]*scale
@@ -1005,12 +1090,12 @@ class EditorApp(BaseEditor):
                     if visible:
                         l,t,r,b=visible
                         l,t,r,b=x+l*scale,y+t*scale,x+r*scale,y+b*scale
-                        self.preview.create_rectangle(l,t,r,b,outline="#00d6ff",width=2)
+                        self.preview.create_rectangle(l,t,r,b,outline=UI_COLORS["primary"],width=2)
                         for hx,hy in ((l,t),(r,t),(l,b),(r,b)):
                             self.preview.create_rectangle(hx-5,hy-5,hx+5,hy+5,
-                                                          fill="#00d6ff",outline="#ffffff")
-                self.preview.create_oval(cx-4,cy-4,cx+4,cy+4,outline="#00d6ff",width=2)
-                self.preview.create_text(cx+8,cy-10,text=f"{state['zoom']:.0f}%",anchor="w",fill="#00d6ff")
+                                                          fill=UI_COLORS["primary"],outline="#ffffff")
+                self.preview.create_oval(cx-4,cy-4,cx+4,cy+4,outline=UI_COLORS["primary"],width=2)
+                self.preview.create_text(cx+8,cy-10,text=f"{state['zoom']:.0f}%",anchor="w",fill=UI_COLORS["primary"])
         except core.EditorError as e:
             self.status.set(str(e).splitlines()[0])
 

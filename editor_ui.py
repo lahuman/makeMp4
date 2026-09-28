@@ -19,6 +19,24 @@ from PIL import ImageTk
 import editor_core as core
 
 
+UI_COLORS = {
+    "window": "#FAFAFA", "surface": "#FFFFFF", "surface_alt": "#F5F6F8",
+    "border": "#E8E8EC", "text": "#0A0A0A", "muted": "#6B6B6B",
+    "primary": "#6366F1", "primary_hover": "#4F46E5", "primary_tint": "#EEF0FF",
+    "preview": "#15171B", "timeline": "#FFFFFF", "track_header": "#F5F6F8",
+    "ruler": "#F5F6F8", "track_text": "#FFFFFF", "track_image": "#FBFBFC",
+    "track_audio": "#FFFFFF", "timeline_text": "#20232A", "timeline_muted": "#6B7280",
+    "grid": "#E6E8EF", "track_divider": "#DDE0E7", "outside": "#F0F1F4",
+    "gap_image": "#FFF4EB", "gap_audio": "#F3F4F6", "clip_border": "#BFC8D3",
+    "image_clip": "#E8F3FB", "image_clip_top": "#4B84AE",
+    "text_clip": "#F3EBF6", "text_clip_top": "#9265A0",
+    "audio_clip": "#E5F4EF", "audio_clip_top": "#319D77", "waveform": "#238B68",
+    "playhead": "#B45309", "dark_text": "#E7EAF1", "dark_muted": "#AEB7C7",
+    "success": "#10B981", "warning": "#F59E0B",
+    "error": "#EF4444",
+}
+
+
 def clock(seconds):
     minutes, remaining = divmod(max(0.0, seconds), 60)
     return f"{int(minutes):02d}:{remaining:06.3f}"
@@ -183,7 +201,7 @@ class EditorApp:
                 and positions[1] <= width - 180
                 and 160 <= positions[2] <= height - 140):
             positions = [min(270, max(210, int(width*.19))),
-                         max(650, width-300), int(height*.59)]
+                         max(650, width-300), int(height*.64)]
         self.body.sashpos(0, positions[0])
         self.body.sashpos(1, positions[1])
         self.workspace.sashpos(0, positions[2])
@@ -199,9 +217,9 @@ class EditorApp:
     def _build(self):
         self._apply_theme()
         self._build_menu()
-        top = ttk.Frame(self.root, style="Header.TFrame", padding=(12, 7)); top.pack(fill="x")
+        top = ttk.Frame(self.root, style="Header.TFrame", padding=(16, 10)); top.pack(fill="x")
         ttk.Label(top, text="음악 파형 슬라이드 편집기", style="Header.TLabel").pack(side="left")
-        self.duration_label = ttk.Label(top, text="음악 00:00.000", style="Muted.TLabel")
+        self.duration_label = ttk.Label(top, text="음악 00:00.000", style="HeaderMuted.TLabel")
         self.duration_label.pack(side="left", padx=16)
         ttk.Button(top, text="MP4 내보내기", style="Primary.TButton", command=self.start_export).pack(side="right")
         self.workspace = ttk.PanedWindow(self.root, orient="vertical")
@@ -224,7 +242,7 @@ class EditorApp:
         ttk.Combobox(search, textvariable=self.library_view, state="readonly", width=7,
                      values=("썸네일", "목록")).pack(side="right", padx=(5, 0))
         library_wrap = ttk.Frame(left, style="Panel.TFrame"); library_wrap.pack(fill="both", expand=True)
-        self.library_canvas = tk.Canvas(library_wrap, highlightthickness=0, bg="#23252a")
+        self.library_canvas = tk.Canvas(library_wrap, highlightthickness=0, bg=UI_COLORS["surface"])
         self.library_canvas.pack(side="left", fill="both", expand=True)
         library_scroll = ttk.Scrollbar(library_wrap, orient="vertical", command=self.library_canvas.yview)
         library_scroll.pack(side="right", fill="y")
@@ -236,8 +254,10 @@ class EditorApp:
         ttk.Button(left, text="선택 이미지를 재생 위치에 추가", command=self.add_selected_asset).pack(fill="x", padx=8, pady=8)
         center = ttk.Frame(body, style="Panel.TFrame")
         body.add(center, weight=5)
-        self._panel_heading(center, "미리보기")
-        self.preview = tk.Canvas(center, bg="#15171b", highlightthickness=0)
+        preview_bar = self._panel_heading(center, "미리보기")
+        self.preview_context = ttk.Label(preview_bar, style="HeaderMuted.TLabel")
+        self.preview_context.pack(side="right")
+        self.preview = tk.Canvas(center, bg=UI_COLORS["preview"], highlightthickness=0)
         self.preview.pack(fill="both", expand=True)
         self.preview.bind("<Configure>", lambda e: self.render_preview())
         self.preview.bind("<ButtonPress-1>", self._preview_down)
@@ -256,7 +276,7 @@ class EditorApp:
         body.add(self.right, weight=1)
         self._panel_heading(self.right, "속성")
         prop_wrap = ttk.Frame(self.right, style="Panel.TFrame"); prop_wrap.pack(fill="both", expand=True)
-        self.property_canvas = tk.Canvas(prop_wrap, bg="#23252a", highlightthickness=0)
+        self.property_canvas = tk.Canvas(prop_wrap, bg=UI_COLORS["surface"], highlightthickness=0)
         self.property_canvas.pack(side="left", fill="both", expand=True)
         prop_scroll = ttk.Scrollbar(prop_wrap, orient="vertical", command=self.property_canvas.yview)
         prop_scroll.pack(side="right", fill="y")
@@ -267,7 +287,7 @@ class EditorApp:
         self.property_canvas.bind("<Configure>", lambda e: self.property_canvas.itemconfigure(self.property_window, width=e.width))
         actions = ttk.Frame(self.right, style="Panel.TFrame", padding=8); actions.pack(fill="x")
         ttk.Button(actions, text="복제", command=self.duplicate_selected).pack(side="left")
-        ttk.Button(actions, text="삭제", command=self.delete_selected).pack(side="left", padx=4)
+        ttk.Button(actions, text="삭제", style="Danger.TButton", command=self.delete_selected).pack(side="left", padx=4)
         timeline_area = ttk.Frame(self.workspace, style="Panel.TFrame")
         self.workspace.add(timeline_area, weight=2)
         timeline_bar = ttk.Frame(timeline_area, style="Panel.TFrame", padding=(8, 5)); timeline_bar.pack(fill="x")
@@ -279,11 +299,14 @@ class EditorApp:
         ttk.Button(timeline_bar, text="+", width=3, command=lambda: self.set_zoom(self.zoom * 1.5)).pack(side="right")
         ttk.Button(timeline_bar, text="−", width=3, command=lambda: self.set_zoom(self.zoom / 1.5)).pack(side="right")
         ttk.Button(timeline_bar, text="전체 맞춤", command=self.fit_zoom).pack(side="right", padx=6)
+        ttk.Separator(timeline_area).pack(fill="x")
         timeline_frame = ttk.Frame(timeline_area, style="Panel.TFrame"); timeline_frame.pack(fill="both", expand=True)
-        self.track_header = tk.Canvas(timeline_frame, width=76, bg="#262930", highlightthickness=0)
+        self.track_header_width = 104
+        self.track_header = tk.Canvas(timeline_frame, width=self.track_header_width,
+                                      bg=UI_COLORS["track_header"], highlightthickness=0)
         self.track_header.pack(side="left", fill="y")
         timeline_body = ttk.Frame(timeline_frame, style="Panel.TFrame"); timeline_body.pack(side="left", fill="both", expand=True)
-        self.timeline = tk.Canvas(timeline_body, bg="#20232a", highlightthickness=0)
+        self.timeline = tk.Canvas(timeline_body, bg=UI_COLORS["timeline"], highlightthickness=0)
         self.timeline.pack(side="left", fill="both", expand=True)
         self.timeline.bind("<Configure>", lambda e: self.draw_timeline())
         self.timeline.bind("<ButtonPress-1>", self._timeline_down)
@@ -307,36 +330,74 @@ class EditorApp:
         self._show_properties()
 
     def _apply_theme(self):
-        self.root.configure(bg="#18191c")
+        c = UI_COLORS
+        self.root.configure(bg=c["window"])
         style = ttk.Style(self.root)
         style.theme_use("clam")
-        style.configure(".", background="#23252a", foreground="#e8eaed", font=("Malgun Gothic", 10))
-        style.configure("TFrame", background="#23252a")
-        style.configure("Panel.TFrame", background="#23252a")
-        style.configure("Header.TFrame", background="#18191c")
-        style.configure("TLabel", background="#23252a", foreground="#e8eaed")
-        style.configure("Header.TLabel", background="#18191c", foreground="#e8eaed", font=("Malgun Gothic", 11, "bold"))
-        style.configure("PanelTitle.TLabel", background="#23252a", foreground="#e8eaed", font=("Malgun Gothic", 10, "bold"))
-        style.configure("Muted.TLabel", background="#23252a", foreground="#afb5bf")
-        style.configure("Time.TLabel", background="#23252a", foreground="#e8eaed", font=("Consolas", 10))
-        style.configure("TButton", background="#30333a", foreground="#e8eaed", borderwidth=0, padding=(8, 5))
-        style.map("TButton", background=[("active", "#3f4550"), ("disabled", "#292b30")])
-        style.configure("Primary.TButton", background="#3978b8", foreground="white", padding=(12, 6))
-        style.map("Primary.TButton", background=[("active", "#4b8ed0")])
-        style.configure("TEntry", fieldbackground="#30333a", foreground="#e8eaed", insertcolor="white")
-        style.configure("TCombobox", fieldbackground="#30333a", background="#30333a", foreground="#e8eaed")
-        style.map("TCombobox", fieldbackground=[("readonly", "#30333a")],
-                  foreground=[("readonly", "#e8eaed")], selectbackground=[("readonly", "#30333a")],
-                  selectforeground=[("readonly", "#e8eaed")])
-        style.configure("TCheckbutton", background="#23252a", foreground="#e8eaed")
-        style.configure("TScrollbar", background="#3b4048", troughcolor="#23252a",
-                        arrowcolor="#afb5bf", bordercolor="#23252a", lightcolor="#3b4048",
-                        darkcolor="#3b4048", relief="flat")
+        style.configure(".", background=c["surface"], foreground=c["text"], font=("Malgun Gothic", 10))
+        style.configure("TFrame", background=c["surface"])
+        style.configure("Panel.TFrame", background=c["surface"])
+        style.configure("Header.TFrame", background=c["surface"])
+        style.configure("TLabel", background=c["surface"], foreground=c["text"])
+        style.configure("Header.TLabel", background=c["surface"], foreground=c["text"], font=("Malgun Gothic", 12, "bold"))
+        style.configure("HeaderMuted.TLabel", background=c["surface"], foreground=c["muted"])
+        style.configure("PanelTitle.TLabel", background=c["surface"], foreground=c["text"], font=("Malgun Gothic", 10, "bold"))
+        style.configure("Muted.TLabel", background=c["surface"], foreground=c["muted"])
+        style.configure("Time.TLabel", background=c["surface"], foreground=c["text"], font=("Consolas", 10, "bold"))
+        style.configure("Library.TFrame", background=c["surface"], borderwidth=1,
+                        bordercolor="#D8DAE2", relief="solid")
+        style.configure("Selected.TFrame", background=c["primary_tint"], borderwidth=2,
+                        bordercolor=c["primary"], relief="solid")
+        style.configure("Selected.TLabel", background=c["primary_tint"], foreground=c["text"])
+        style.configure("Source.TLabel", background=c["primary_tint"], foreground=c["primary"],
+                        padding=(8, 5), font=("Malgun Gothic", 9, "bold"))
+        style.configure("Result.TFrame", background=c["surface_alt"], borderwidth=1,
+                        bordercolor=c["border"], relief="solid")
+        style.configure("ResultTitle.TLabel", background=c["surface_alt"], foreground=c["text"],
+                        font=("Malgun Gothic", 10, "bold"))
+        style.configure("ResultMuted.TLabel", background=c["surface_alt"], foreground=c["muted"])
+        style.configure("Success.TLabel", background=c["surface"], foreground="#047857")
+        style.configure("TButton", background=c["surface_alt"], foreground=c["text"],
+                        borderwidth=1, bordercolor="#D8DAE2", relief="solid", padding=(9, 6))
+        style.map("TButton", background=[("active", "#ECEEF4"), ("disabled", c["surface_alt"])],
+                  foreground=[("disabled", c["muted"])], bordercolor=[("focus", c["primary"]), ("active", c["primary"])])
+        style.configure("Primary.TButton", background=c["primary"], foreground="white",
+                        bordercolor=c["primary"], padding=(12, 7))
+        style.map("Primary.TButton", background=[("active", c["primary_hover"]), ("disabled", c["border"])],
+                  foreground=[("active", "white"), ("disabled", c["muted"])],
+                  bordercolor=[("active", c["primary_hover"]), ("disabled", c["border"])])
+        style.configure("Danger.TButton", foreground="#B91C1C", bordercolor="#FECACA")
+        style.map("Danger.TButton", foreground=[("active", "#B91C1C")])
+        style.configure("TEntry", fieldbackground=c["surface"], foreground=c["text"],
+                        insertcolor=c["text"], bordercolor=c["border"], padding=5)
+        style.map("TEntry", bordercolor=[("focus", c["primary"])])
+        style.configure("TCombobox", fieldbackground=c["surface"], background=c["surface"],
+                        foreground=c["text"], bordercolor=c["border"], padding=4)
+        style.map("TCombobox", fieldbackground=[("readonly", c["surface"])],
+                  foreground=[("readonly", c["text"])], selectbackground=[("readonly", c["surface"])],
+                  selectforeground=[("readonly", c["text"])], bordercolor=[("focus", c["primary"])])
+        style.configure("TCheckbutton", background=c["surface"], foreground=c["text"])
+        style.map("TCheckbutton", background=[("active", c["surface"])])
+        style.configure("TScrollbar", background=c["surface_alt"], troughcolor=c["surface"],
+                        arrowcolor=c["muted"], bordercolor=c["border"], lightcolor=c["surface_alt"],
+                        darkcolor=c["surface_alt"], relief="flat")
+        style.configure("TSeparator", background=c["border"])
+        style.configure("TPanedwindow", background=c["border"], sashwidth=4, sashrelief="flat")
+        style.configure("Treeview", background=c["surface"], fieldbackground=c["surface"],
+                        foreground=c["text"], bordercolor=c["border"], rowheight=28)
+        style.map("Treeview", background=[("selected", c["primary_tint"])],
+                  foreground=[("selected", c["text"])])
+        style.configure("Treeview.Heading", background=c["surface_alt"], foreground=c["muted"],
+                        relief="flat", padding=(8, 7), font=("Malgun Gothic", 9, "bold"))
+        style.map("Treeview.Heading", background=[("active", c["primary_tint"])])
+        style.configure("TProgressbar", troughcolor=c["surface_alt"], background=c["primary"],
+                        bordercolor=c["border"], lightcolor=c["primary"], darkcolor=c["primary"])
 
     def _panel_heading(self, parent, title):
-        bar = ttk.Frame(parent, style="Panel.TFrame", padding=(9, 6)); bar.pack(fill="x")
+        bar = ttk.Frame(parent, style="Panel.TFrame", padding=(12, 8)); bar.pack(fill="x")
         ttk.Label(bar, text=title, style="PanelTitle.TLabel").pack(side="left")
         ttk.Separator(parent).pack(fill="x")
+        return bar
 
     def _prompt_time(self, event=None):
         value = simpledialog.askstring("시각으로 이동", "분:초.밀리초 또는 초를 입력하세요.",
@@ -364,7 +425,8 @@ class EditorApp:
             ("보기", (("프로젝트 패널", lambda: self.toggle_panel("left")),
                     ("속성 패널", lambda: self.toggle_panel("right")),
                     ("전체 길이 맞춤", self.fit_zoom), ("기본 배치 복원", self.reset_layout)))):
-            sub = tk.Menu(menu, tearoff=False, bg="#23252a", fg="#e8eaed", activebackground="#3978b8")
+            sub = tk.Menu(menu, tearoff=False, bg=UI_COLORS["surface"], fg=UI_COLORS["text"],
+                          activebackground=UI_COLORS["primary_tint"], activeforeground=UI_COLORS["text"])
             for label, action in entries: sub.add_command(label=label, command=action)
             menu.add_cascade(label=title, menu=sub)
         self.root.configure(menu=menu)
@@ -433,11 +495,13 @@ class EditorApp:
         shown = 0
         for a in self.project["assets"]:
             if query and query not in Path(a["path"]).name.casefold(): continue
-            row = ttk.Frame(self.library_frame, padding=5, style="Panel.TFrame")
+            selected = a["id"] == self.library_selection
+            row = ttk.Frame(self.library_frame, padding=8,
+                            style="Selected.TFrame" if selected else "Library.TFrame")
             if icon_view:
-                row.grid(row=shown//2, column=shown%2, sticky="nsew", padx=2, pady=2)
+                row.grid(row=shown//2, column=shown%2, sticky="nsew", padx=4, pady=4)
             else:
-                row.grid(row=shown, column=0, columnspan=2, sticky="ew", pady=1)
+                row.grid(row=shown, column=0, columnspan=2, sticky="ew", padx=4, pady=2)
             shown += 1
             try:
                 from PIL import Image, ImageOps
@@ -453,16 +517,20 @@ class EditorApp:
                     if len(self.thumbnail_cache) > 180: self.thumbnail_cache.clear()
                     self.thumbnail_cache[key] = photo
                 self.thumb_refs.append(photo)
-                thumb = ttk.Label(row, image=photo)
+                thumb = ttk.Label(row, image=photo,
+                                  style="Selected.TLabel" if selected else "TLabel")
             except Exception:
-                thumb = ttk.Label(row, text="이미지 없음", width=10)
+                thumb = ttk.Label(row, text="이미지 없음", width=10,
+                                  style="Selected.TLabel" if selected else "TLabel")
             thumb.pack(side="top" if icon_view else "left")
-            label = ttk.Label(row, text=Path(a["path"]).name, wraplength=108 if icon_view else 165)
+            label = ttk.Label(row, text=Path(a["path"]).name, wraplength=108 if icon_view else 165,
+                              style="Selected.TLabel" if selected else "TLabel")
             label.pack(side="top" if icon_view else "left", padx=5)
             for widget in (row, thumb, label):
                 widget.bind("<ButtonPress-1>", lambda e, ident=a["id"]: self._library_down(ident))
-            marker = ttk.Label(row, text="●" if a["id"] == self.library_selection else "",
-                               foreground="#65a6ff")
+            marker = ttk.Label(row, text="●" if selected else "",
+                               background=UI_COLORS["primary_tint"] if selected else UI_COLORS["surface"],
+                               foreground=UI_COLORS["primary"])
             marker.pack(side="right")
             self.library_markers[a["id"]] = marker
         self.library_frame.columnconfigure(0, weight=1)
@@ -780,7 +848,10 @@ class EditorApp:
         parent = parent or self.properties
         ttk.Label(parent, text="문구 (여러 줄)").pack(anchor="w")
         box = tk.Text(parent, height=4, wrap="word", font=("Malgun Gothic", 10),
-                      bg="#30333a", fg="#e8eaed", insertbackground="white", relief="flat")
+                      bg=UI_COLORS["surface"], fg=UI_COLORS["text"],
+                      insertbackground=UI_COLORS["text"], relief="solid", bd=1,
+                      highlightthickness=1, highlightbackground=UI_COLORS["border"],
+                      highlightcolor=UI_COLORS["primary"])
         box.insert("1.0", item["text"]); box.pack(fill="x")
         box.bind("<FocusOut>", lambda e: self._commit("text", box.get("1.0", "end-1c"), item["id"]))
         box.bind("<Control-Return>", lambda e: (self._commit("text", box.get("1.0", "end-1c"), item["id"]), "break"))
@@ -950,7 +1021,7 @@ class EditorApp:
         c.create_rectangle(0,image_y,full_w,audio_y,fill="#272a32",outline="")
         c.create_rectangle(0,audio_y,full_w,height,fill="#242a30",outline="")
         self.track_header.delete("all")
-        self.track_header.configure(scrollregion=(0,0,76,height))
+        self.track_header.configure(scrollregion=(0,0,self.track_header_width,height))
         for y,label in ((image_y+29,"이미지"),(audio_y+29,"음악")):
             self.track_header.create_text(8,y,text=label,anchor="w",fill="#d6d6d6",font=("Malgun Gothic",9))
         for lane in range(text_rows):
@@ -1201,7 +1272,7 @@ class EditorApp:
             self.export_dialog.lift(); return
         dialog = tk.Toplevel(self.root)
         dialog.title("MP4 내보내기")
-        dialog.configure(bg="#23252a")
+        dialog.configure(bg=UI_COLORS["surface"])
         dialog.resizable(False, False)
         dialog.transient(self.root)
         self.export_dialog = dialog
@@ -1223,12 +1294,12 @@ class EditorApp:
         ttk.Button(folder_row, text="찾기…", command=self._browse_export_folder).pack(side="right", padx=(6, 0))
         ttk.Label(self.export_form, text=f"{clock(self.duration)}  ·  1920×1080  ·  30fps  ·  H.264 / AAC",
                   style="Muted.TLabel").pack(anchor="w", pady=(2, 12))
-        self.export_result_frame = ttk.Frame(body, style="Panel.TFrame")
-        self.export_result_name = ttk.Label(self.export_result_frame, style="PanelTitle.TLabel", wraplength=320)
+        self.export_result_frame = ttk.Frame(body, style="Result.TFrame", padding=12)
+        self.export_result_name = ttk.Label(self.export_result_frame, style="ResultTitle.TLabel", wraplength=320)
         self.export_result_name.pack(anchor="w", pady=(0, 8))
-        self.export_result_details = ttk.Label(self.export_result_frame, style="Muted.TLabel", wraplength=320)
+        self.export_result_details = ttk.Label(self.export_result_frame, style="ResultMuted.TLabel", wraplength=320)
         self.export_result_details.pack(anchor="w", pady=(0, 8))
-        self.export_result_path = ttk.Label(self.export_result_frame, style="Muted.TLabel", wraplength=320)
+        self.export_result_path = ttk.Label(self.export_result_frame, style="ResultMuted.TLabel", wraplength=320)
         self.export_result_path.pack(anchor="w", pady=(0, 8))
         self.export_status_label = ttk.Label(body, text="저장 위치를 확인하세요.", style="Muted.TLabel")
         self.export_status_label.pack(anchor="w", pady=(0, 4))
@@ -1240,7 +1311,8 @@ class EditorApp:
         self.export_start_button.pack(side="right")
         self.export_cancel_button = ttk.Button(buttons, text="닫기", command=self._close_export_dialog)
         self.export_cancel_button.pack(side="right", padx=7)
-        self.export_result_button = ttk.Button(buttons, text="결과 열기", command=self.open_result)
+        self.export_result_button = ttk.Button(buttons, text="결과 열기", style="Primary.TButton",
+                                               command=self.open_result)
         self.export_folder_button = ttk.Button(buttons, text="폴더 열기", command=self.open_result_folder)
         self.export_copy_button = ttk.Button(buttons, text="경로 복사", command=self._copy_export_path)
         dialog.protocol("WM_DELETE_WINDOW", self._close_export_dialog)
@@ -1270,8 +1342,8 @@ class EditorApp:
         self.export_result_details.configure(
             text=f"길이 {clock(self.duration)}  ·  파일 크기 {size / 1048576:.1f} MB\n1920×1080  ·  30fps")
         self.export_result_path.configure(text=str(result))
-        self.export_result_frame.pack(fill="x", before=self.export_status_label)
-        self.export_status_label.configure(text="영상이 저장되었습니다.")
+        self.export_result_frame.pack(fill="x", pady=(0, 10), before=self.export_status_label)
+        self.export_status_label.configure(text="영상이 저장되었습니다.", style="Success.TLabel")
         self.export_start_button.pack_forget()
         self.export_cancel_button.configure(text="닫기")
         self.export_folder_button.pack(side="left", padx=(7, 0))

@@ -52,7 +52,7 @@ class InitialLayoutTests(unittest.TestCase):
         height = app.workspace.winfo_height()
         self.assertAlmostEqual(app.body.sashpos(0), min(270, max(210, int(width * .19))), delta=2)
         self.assertAlmostEqual(app.body.sashpos(1), max(650, width - 300), delta=2)
-        self.assertAlmostEqual(app.workspace.sashpos(0), int(height * .59), delta=2)
+        self.assertAlmostEqual(app.workspace.sashpos(0), int(height * .64), delta=2)
         self.assertGreater(app.body.winfo_height(), 160)
         self.assertGreater(app.timeline.winfo_height(), 100)
 
@@ -215,6 +215,40 @@ class InitialLayoutTests(unittest.TestCase):
         app._copy_export_path()
         self.assertEqual(self.root.clipboard_get(), str(result))
         app._close_export_dialog()
+
+    def test_audio_track_uses_available_height_and_black_preview_is_explained(self):
+        app = EditorApp(self.root)
+        app.project["audio_assets"] = [{"id": "audio", "path": "test.wav", "samples": 480000}]
+        app.project["audio_clips"] = [{"id": "music", "asset": "audio", "start_sample": 0,
+                                        "source_in": 0, "source_out": 480000}]
+        app.audio_cache["audio"] = {"pcm": "", "bins": [], "samples": 480000}
+        self.root.deiconify()
+        self.settle()
+        app.position = 5
+        app._refresh()
+        self.assertGreater(app.audio_track_height, 64)
+        self.assertEqual(app._track_at(app.audio_y + app.audio_track_height - 8), "audio")
+        self.assertEqual(app.preview_context.cget("text"), "이미지 없음 · 검은 화면")
+
+    def test_timeline_shows_light_ruler_image_thumbnail_and_selected_clip(self):
+        image_path = Path(self.folder.name) / "timeline.png"
+        Image.new("RGB", (160, 90), "#3579a5").save(image_path)
+        app = EditorApp(self.root)
+        app.project["assets"] = [{"id": "asset", "path": str(image_path)}]
+        clip = core.image_defaults("asset", 0, 180)
+        app.project["images"] = [clip]
+        app.selection = ("image", clip["id"])
+        self.root.deiconify()
+        self.settle()
+        app._refresh()
+        ruler_items = app.timeline.find_overlapping(1, 1, 10, 10)
+        self.assertTrue(any(app.timeline.itemcget(item, "fill") == "#F5F6F8"
+                            for item in ruler_items))
+        clip_items = [item for item in app.timeline.find_all()
+                      if app.timeline.gettags(item)[:2] == ("image", clip["id"])]
+        self.assertTrue(any(app.timeline.type(item) == "image" for item in clip_items))
+        self.assertTrue(any(app.timeline.itemcget(item, "outline") == "#6366F1"
+                            for item in clip_items if app.timeline.type(item) == "rectangle"))
 
     def test_timeline_drag_commits_once_and_rejects_overlap(self):
         app = EditorApp(self.root)
