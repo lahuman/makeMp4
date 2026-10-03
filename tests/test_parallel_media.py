@@ -12,6 +12,44 @@ import editor_core as core
 
 
 class ParallelMediaTests(unittest.TestCase):
+    def test_fades_follow_clip_time_across_chunks_and_source_trim(self):
+        clips = [{"asset": "a", "start_sample": 2, "source_in": 3, "source_out": 11,
+                  "fade_in_samples": 3, "fade_out_samples": 3}]
+        streams = {"a": BytesIO(array("f", [.5, .25] * 11).tobytes())}
+        whole = core.mixed_audio_chunk(clips, streams, 0, 12)
+        pieces = b"".join(core.mixed_audio_chunk(clips, streams, start, 3) for start in range(0, 12, 3))
+        self.assertEqual(whole, pieces)
+        samples = array("f")
+        samples.frombytes(whole)
+        self.assertEqual(list(samples[::2]), [0, 0, 0, .25, .5, .5, .5, .5, .25, 0, 0, 0])
+        self.assertEqual(list(samples[1::2]), [x / 2 for x in samples[::2]])
+
+    def test_faded_export_matches_playback_and_survives_project_reload(self):
+        with tempfile.TemporaryDirectory() as folder:
+            project = core.fresh()
+            source = Path(folder) / "source.f32le"
+            source.write_bytes(array("f", [.5, .5] * 20000).tobytes())
+            project["audio_assets"] = [{"id": "a", "path": str(source), "samples": 20000}]
+            first = core.audio_defaults("a", 0, 20000)
+            second = core.audio_defaults("a", 20000, 20000)
+            project["audio_clips"] = [first, second]
+            saved = Path(folder) / "project.json"
+            core.save_project(project, saved)
+            project = core.load_project(saved)
+            self.assertEqual(project["audio_clips"][1]["fade_out_samples"], core.RATE)
+            output = Path(folder) / "mix.f32le"
+            core.assemble_audio(project, {"a": source}, output, threading.Event())
+            with source.open("rb") as stream:
+                expected = core.mixed_audio_chunk(project["audio_clips"], {"a": stream}, 0, 40000)
+            self.assertEqual(output.read_bytes(), expected)
+            values = array("f")
+            values.frombytes(expected)
+            self.assertEqual(values[0], 0)
+            self.assertEqual(values[39998], 0)
+            self.assertEqual(values[40000], 0)
+            self.assertEqual(values[-1], 0)
+            self.assertGreater(values[20000], 0)
+
     def test_overlapping_images_compose_in_project_order(self):
         with tempfile.TemporaryDirectory() as folder:
             background = Path(folder) / "background.png"

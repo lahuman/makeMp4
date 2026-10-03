@@ -21,6 +21,7 @@ SIZE = (1920, 1080)
 RATE = 48000
 AUDIO_EXTS = {".flac", ".wav", ".mp3"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
+VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm"}
 
 
 class EditorError(Exception):
@@ -32,7 +33,8 @@ def uid():
 
 
 def fresh():
-    return {"version": 2, "audio_assets": [], "audio_clips": [], "assets": [], "images": [], "texts": [],
+    return {"version": 3, "audio_assets": [], "audio_clips": [], "assets": [], "images": [], "texts": [],
+            "video_assets": [], "videos": [],
             "settings": {"width": 1920, "height": 1080, "fps": 30, "audio_bitrate": "320k"}}
 
 
@@ -47,12 +49,65 @@ def audio_start(clip):
     return int(clip["start_sample"])
 
 
+def audio_defaults(asset, start, samples):
+    return {"id": uid(), "asset": asset, "start_sample": int(start),
+            "source_in": 0, "source_out": int(samples),
+            "fade_in_samples": RATE, "fade_out_samples": RATE}
+
+
 def audio_end(clip):
     return audio_start(clip) + int(clip["source_out"]) - int(clip["source_in"])
 
 
+def video_defaults(asset, start, frames):
+    clip = image_defaults(asset, start, start + frames)
+    clip.update(source_in_frame=0, source_out_frame=int(frames), audio_enabled=False,
+                audio_gain=1.0, fade_in_samples=0, fade_out_samples=0)
+    return clip
+
+
+def video_end(clip):
+    return clip["start"] + clip["source_out_frame"] - clip["source_in_frame"]
+
+
+def valid_video(project, clip):
+    asset = next((a for a in project.get("video_assets", []) if a["id"] == clip["asset"]), None)
+    return bool(asset and all(type(clip.get(k)) is int for k in ("start", "end", "source_in_frame", "source_out_frame"))
+                and 0 <= clip["source_in_frame"] < clip["source_out_frame"] <= asset.get("frames", 0)
+                and clip["start"] >= 0 and clip["end"] == video_end(clip)
+                and math.isfinite(clip.get("audio_gain", 1)) and 0 <= clip.get("audio_gain", 1) <= 2)
+
+
+def visual_clips(project):
+    images = project["images"]
+    videos = project.get("videos", [])
+    return sorted(images + videos, key=lambda c: c.get("order", images.index(c) if c in images else len(images)))
+
+
+def next_visual_order(project):
+    return max((c.get("order", i) for i, c in enumerate(visual_clips(project))), default=-1) + 1
+
+
+def timeline_audio(project):
+    """Derive linked video audio so trimming never creates a second source of truth."""
+    clips = list(project["audio_clips"])
+    assets = {a["id"]: a for a in project.get("video_assets", [])}
+    for video in project.get("videos", []):
+        asset = assets.get(video["asset"])
+        if video.get("audio_enabled") and asset and asset.get("has_audio"):
+            clips.append({"id": video["id"], "asset": "video:" + video["asset"],
+                          "start_sample": video["start"] * (RATE // FPS),
+                          "source_in": video["source_in_frame"] * (RATE // FPS),
+                          "source_out": video["source_out_frame"] * (RATE // FPS),
+                          "gain": video.get("audio_gain", 1.0),
+                          "fade_in_samples": video.get("fade_in_samples", 0),
+                          "fade_out_samples": video.get("fade_out_samples", 0)})
+    return clips
+
+
 def duration_samples(project):
-    return max((audio_end(c) for c in project["audio_clips"]), default=0)
+    return max([0] + [audio_end(c) for c in project["audio_clips"]]
+               + [video_end(c) * (RATE // FPS) for c in project.get("videos", [])])
 
 
 def duration_seconds(project):
@@ -73,7 +128,7 @@ def valid_audio(project, clip, exclude=None):
 def paths_in(project, project_file):
     base = Path(project_file).parent
     data = copy.deepcopy(project)
-    for asset in data["assets"] + data.get("audio_assets", []):
+    for asset in data["assets"] + data.get("audio_assets", []) + data.get("video_assets", []):
         asset["path"] = str((base / asset["path"]).resolve())
     if data.get("audio"):
         data["audio"] = str((base / data["audio"]).resolve())
@@ -84,6 +139,7 @@ def save_project(project, path):
     path = Path(path)
     data = copy.deepcopy(project)
     data.pop("_migrated", None)
+    data.pop("_migrated_v1", None)
     def relative(value):
         try:
             return os.path.relpath(Path(value).resolve(), path.parent.resolve())
@@ -91,7 +147,7 @@ def save_project(project, path):
             return str(Path(value).resolve())
     if data.get("audio"):
         data["audio"] = relative(data["audio"])
-    for asset in data["assets"] + data.get("audio_assets", []):
+    for asset in data["assets"] + data.get("audio_assets", []) + data.get("video_assets", []):
         asset["path"] = relative(asset["path"])
     temp = path.with_name("." + path.name + "." + uid() + ".tmp")
     try:
@@ -106,11 +162,21 @@ def save_project(project, path):
 def load_project(path):
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
-        if data.get("version") not in (1, 2) or not all(k in data for k in ("assets", "images", "texts")):
+        if data.get("version") not in (1, 2, 3) or not all(k in data for k in ("assets", "images", "texts")):
             raise ValueError("지원하지 않는 프로젝트 형식")
         data = paths_in(data, path)
         if data["version"] == 1:
             migrate_v1(data)
+            data["_migrated_v1"] = True
+        if data["version"] == 2:
+            data["version"] = 3
+            data["_migrated"] = True
+        data.setdefault("video_assets", [])
+        data.setdefault("videos", [])
+        for index, clip in enumerate(data["images"]):
+            clip.setdefault("order", index)
+        for clip in data["videos"]:
+            if not valid_video(data, clip): raise ValueError("영상 클립의 원본 범위 또는 시간이 잘못되었습니다.")
         return data
     except (OSError, ValueError, TypeError, KeyError) as e:
         raise EditorError(f"프로젝트를 열 수 없습니다. JSON 파일 형식을 확인하세요.\n{e}") from e
@@ -126,6 +192,9 @@ def missing_media(project):
     for a in project["assets"]:
         if not Path(a["path"]).is_file():
             result.append(("image", a["id"], a["path"]))
+    for a in project.get("video_assets", []):
+        if not Path(a["path"]).is_file():
+            result.append(("video", a["id"], a["path"]))
     return result
 
 
@@ -287,6 +356,10 @@ def active_images(project, frame):
     return [c for c in project["images"] if c["start"] <= frame < c["end"]]
 
 
+def active_visuals(project, frame):
+    return [c for c in visual_clips(project) if c["start"] <= frame < c["end"]]
+
+
 def transform_at(cue, frame):
     first = cue.get("from", {"x": 960, "y": 540, "zoom": 100})
     if not cue.get("motion") or cue["end"] - cue["start"] <= 1:
@@ -298,8 +371,12 @@ def transform_at(cue, frame):
     return {key: first[key] + (last[key] - first[key]) * fraction for key in ("x", "y", "zoom")}
 
 
-def image_layer(project, cue, frame):
+def image_layer(project, cue, frame, video_frames=None):
     canvas = Image.new("RGBA", SIZE, (0, 0, 0, 0))
+    if "source_in_frame" in cue:
+        if video_frames is None: raise EditorError("영상 디코더가 준비되지 않았습니다.")
+        image = video_frames.get(cue, frame).convert("RGBA")
+        return picture_layer(image, cue, frame)
     asset = next((a for a in project["assets"] if a["id"] == cue["asset"]), None)
     if not asset: return canvas
     try:
@@ -307,6 +384,11 @@ def image_layer(project, cue, frame):
             image = ImageOps.exif_transpose(src).convert("RGBA")
     except (OSError, ValueError) as e:
         raise EditorError(f"이미지를 읽을 수 없습니다: {asset['path']}\n{e}") from e
+    return picture_layer(image, cue, frame)
+
+
+def picture_layer(image, cue, frame):
+    canvas = Image.new("RGBA", SIZE, (0, 0, 0, 0))
     fitted = min(SIZE[0] / image.width, SIZE[1] / image.height)
     if cue.get("legacy_native"): fitted = min(1, fitted)
     state = transform_at(cue, frame)
@@ -319,6 +401,14 @@ def image_layer(project, cue, frame):
 
 
 def image_bounds(project, cue, frame):
+    if "source_in_frame" in cue:
+        asset = next((a for a in project.get("video_assets", []) if a["id"] == cue["asset"]), None)
+        if not asset: return None
+        width, height = asset["width"], asset["height"]
+        state = transform_at(cue, frame)
+        factor = min(SIZE[0] / width, SIZE[1] / height) * max(10, min(500, state["zoom"])) / 100
+        return (state["x"]-width*factor/2, state["y"]-height*factor/2,
+                state["x"]+width*factor/2, state["y"]+height*factor/2)
     asset = next((a for a in project["assets"] if a["id"] == cue["asset"]), None)
     if not asset: return None
     with Image.open(asset["path"]) as source:
@@ -333,6 +423,7 @@ def image_bounds(project, cue, frame):
 
 
 def transition_info(project, cue):
+    if "source_in_frame" in cue: return "cut", 0, None
     value = cue.get("transition", {})
     effect = value.get("type", "cut")
     previous = next((other for other in project["images"]
@@ -343,6 +434,7 @@ def transition_info(project, cue):
 
 
 def dynamic_frame(project, frame):
+    if any(c["start"] <= frame < c["end"] for c in project.get("videos", [])): return True
     for cue in active_images(project, frame):
         if cue.get("motion"): return True
         effect, length, _ = transition_info(project, cue)
@@ -398,11 +490,13 @@ def text_box(item):
     return text_layout(item)[3]
 
 
-def render_scene(project, frame, warn=None):
+def render_scene(project, frame, warn=None, video_frames=None):
     """The one compositor used for the editor preview and exported stills."""
     canvas = Image.new("RGBA", SIZE, (0, 0, 0, 255))
-    for cue in active_images(project, frame):
-        incoming = image_layer(project, cue, frame)
+    visible_clips = active_visuals(project, frame)
+    if video_frames is not None: video_frames.begin_frame(visible_clips)
+    for cue in visible_clips:
+        incoming = image_layer(project, cue, frame, video_frames)
         effect, length, previous = transition_info(project, cue)
         if effect != "cut" and frame < cue["start"] + length:
             outgoing = image_layer(project, previous, previous["end"] - 1)
@@ -455,6 +549,9 @@ def render_scene(project, frame, warn=None):
 
 def scene_boundaries(project, frames):
     values = {0, frames}
+    for cue in project.get("videos", []):
+        values.add(max(0, min(frames, cue["start"])))
+        values.add(max(0, min(frames, cue["end"])))
     for cue in project["images"]:
         values.add(max(0, min(frames, int(cue["start"]))))
         values.add(max(0, min(frames, int(cue["end"]))))
@@ -473,21 +570,24 @@ def concat_path(path):
 def assemble_audio(project, pcm_paths, destination, cancel):
     """Write a sample-accurate mix of every active clip in bounded chunks."""
     from contextlib import ExitStack
-    clips = project["audio_clips"]
+    clips = timeline_audio(project)
     if any(not valid_audio(project, clip) for clip in clips):
         raise EditorError("음원 클립의 시간 범위가 올바르지 않습니다.")
     with ExitStack() as stack:
         streams = {}
         for clip in clips:
             asset = next((a for a in project["audio_assets"] if a["id"] == clip["asset"]), None)
+            if clip["asset"].startswith("video:"):
+                asset = next((dict(a, samples=a["frames"]*(RATE//FPS))
+                              for a in project.get("video_assets", []) if "video:"+a["id"] == clip["asset"]), None)
             if not asset: raise EditorError("음원 파일 참조를 찾지 못했습니다.")
-            source = pcm_paths.get(asset["id"])
+            source = pcm_paths.get(clip["asset"])
             if not source or not Path(source).is_file():
                 raise EditorError("음원 분석 캐시가 없습니다. 음원을 다시 분석하세요.")
             if clip["source_out"] > asset["samples"]:
                 raise EditorError("음원 사용 구간이 원본 길이를 넘습니다. 다시 분석하세요.")
-            if asset["id"] not in streams:
-                streams[asset["id"]] = stack.enter_context(Path(source).open("rb"))
+            if clip["asset"] not in streams:
+                streams[clip["asset"]] = stack.enter_context(Path(source).open("rb"))
         final = duration_samples(project)
         with Path(destination).open("wb") as out:
             for cursor in range(0, final, 16384):
@@ -515,7 +615,27 @@ def mixed_audio_chunk(clips, streams, cursor, count):
         raw = source.read((end - begin) * 8)
         if len(raw) != (end - begin) * 8:
             raise EditorError("오디오 캐시가 짧습니다. 다시 분석하세요.")
+        length = audio_end(clip) - audio_start(clip)
+        fade_in = min(max(0, int(clip.get("fade_in_samples", 0))), length)
+        fade_out = min(max(0, int(clip.get("fade_out_samples", 0))), length)
+        clip_gain = float(clip.get("gain", 1.0))
+        if fade_in or fade_out or clip_gain != 1:
+            samples = array("f")
+            samples.frombytes(raw)
+            for frame in range(end - begin):
+                position = begin - audio_start(clip) + frame
+                gain = 1.0
+                if fade_in:
+                    gain = min(gain, position / max(1, fade_in - 1))
+                if fade_out:
+                    gain = min(gain, (length - 1 - position) / max(1, fade_out - 1))
+                samples[frame * 2] *= gain * clip_gain
+                samples[frame * 2 + 1] *= gain * clip_gain
+            raw = samples.tobytes()
         if not overlapping:
+            if clip_gain > 1:
+                samples = array("f"); samples.frombytes(raw)
+                raw = array("f", (max(-1.0, min(1.0, v)) for v in samples)).tobytes()
             output[(begin - cursor) * 8:(end - cursor) * 8] = raw
             continue
         samples = array("f")
@@ -532,6 +652,7 @@ def mixed_audio_chunk(clips, streams, cursor, count):
 
 def _run_encoder(command, cancel, progress=None, input_frames=None):
     """Read both FFmpeg pipes so a full pipe cannot stall cancellation."""
+    if cancel.is_set(): raise EditorError("작업을 취소했습니다.")
     p = subprocess.Popen(command, stdin=subprocess.PIPE if input_frames is not None else subprocess.DEVNULL,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -565,6 +686,7 @@ def _run_encoder(command, cancel, progress=None, input_frames=None):
             if cancel.is_set(): raise EditorError("작업을 취소했습니다.")
             cancel.wait(.1)
         for t in readers: t.join(2)
+        if cancel.is_set(): raise EditorError("작업을 취소했습니다.")
         if p.returncode:
             raise EditorError("MP4 변환 실패: FFmpeg와 입력 파일, 디스크 공간을 확인하세요.\n" + "".join(errors)[-1000:])
     except (BrokenPipeError, OSError) as e:
@@ -576,6 +698,10 @@ def _run_encoder(command, cancel, progress=None, input_frames=None):
             p.terminate()
             try: p.wait(2)
             except subprocess.TimeoutExpired: p.kill(); p.wait()
+        watchdog.join(1)
+        for reader in readers: reader.join(2)
+        for pipe in (p.stdin, p.stdout, p.stderr):
+            if pipe and not pipe.closed: pipe.close()
 
 
 def export_video(project, duration, output, ffmpeg, cancel, report=None, pcm_paths=None):
@@ -583,7 +709,9 @@ def export_video(project, duration, output, ffmpeg, cancel, report=None, pcm_pat
     output = Path(output).resolve()
     if output.exists(): raise EditorError("같은 이름의 출력 파일이 있습니다. 새 이름을 지정하세요.")
     if not output.parent.is_dir(): raise EditorError("저장 폴더가 없습니다.")
-    if not project["audio_clips"]: raise EditorError("타임라인에 음원을 배치하세요.")
+    if not duration_samples(project): raise EditorError("타임라인에 음악 또는 영상을 배치하세요.")
+    if any(not valid_video(project, c) for c in project.get("videos", [])):
+        raise EditorError("영상 클립의 원본 범위가 잘못되었습니다.")
     if missing_media(project): raise EditorError("원본 미디어가 없습니다. 프로젝트에서 파일을 다시 연결하세요.")
     pcm_paths = pcm_paths or {}
     frames = total_frames(duration_seconds(project))
@@ -594,7 +722,9 @@ def export_video(project, duration, output, ffmpeg, cancel, report=None, pcm_pat
     except OSError as e:
         raise EditorError("저장 폴더에 쓰기 실패: 권한과 디스크 공간을 확인하세요.\n" + str(e)) from e
     try:
-        with tempfile.TemporaryDirectory(prefix="music_video_scenes_") as temporary:
+        from video_media import VideoFrameProvider
+        with tempfile.TemporaryDirectory(prefix="music_video_scenes_") as temporary, \
+                VideoFrameProvider(project["video_assets"] if "video_assets" in project else [], ffmpeg, cancel) as video_frames:
             scratch = Path(temporary)
             audio_path = scratch / "timeline.f32le"
             written = assemble_audio(project, pcm_paths, audio_path, cancel)
@@ -614,10 +744,10 @@ def export_video(project, duration, output, ffmpeg, cancel, report=None, pcm_pat
                                "-i", "pipe:0", "-vf", "format=yuv420p", "-c:v", "libx264",
                                "-preset", "medium", "-crf", "23", "-frames:v", str(count), "-an", str(segment)]
                     _run_encoder(command, cancel, lambda n: report(5 + int(75*(begin+n)/frames)) if report else None,
-                                 (render_scene(project, f) for f in range(begin, end)))
+                                 (render_scene(project, f, video_frames=video_frames) for f in range(begin, end)))
                 else:
                     image_path = scratch / f"scene_{index:06d}.png"
-                    render_scene(project, begin).save(image_path)
+                    render_scene(project, begin, video_frames=video_frames).save(image_path)
                     command = [ffmpeg, "-hide_banner", "-nostdin", "-y", "-loop", "1", "-framerate", "30",
                                "-i", str(image_path), "-vf", "format=yuv420p", "-c:v", "libx264",
                                "-preset", "medium", "-tune", "stillimage", "-crf", "23", "-r", "30",

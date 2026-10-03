@@ -226,6 +226,95 @@ class InitialLayoutTests(unittest.TestCase):
         self.assertEqual(self.root.clipboard_get(), str(result))
         app._close_export_dialog()
 
+    def test_bulk_media_append_keeps_order_and_can_be_undone(self):
+        app = EditorApp(self.root)
+        app.project["audio_assets"] = [{"id": "a", "path": "a.wav", "samples": 96000},
+                                       {"id": "b", "path": "b.wav", "samples": 144001}]
+        app.append_all_audio()
+        self.assertEqual(app.project["audio_clips"], [])
+        app.audio_cache = {a["id"]: {"pcm": "", "bins": [], "samples": a["samples"]}
+                           for a in app.project["audio_assets"]}
+        app.append_all_audio()
+        clips = app.project["audio_clips"]
+        self.assertEqual([c["asset"] for c in clips], ["a", "b"])
+        self.assertEqual(core.audio_start(clips[1]), core.audio_end(clips[0]))
+        self.assertEqual(core.duration_samples(app.project), 240001)
+        app.append_all_audio()
+        self.assertEqual(len(clips), 2)
+        app.selection = ("audio", clips[1]["id"])
+        app._commit("fade_in_seconds", "0.25")
+        self.assertEqual(clips[1]["fade_in_samples"], 12000)
+        app.undo_action()
+        self.assertEqual(app.project["audio_clips"][1]["fade_in_samples"], core.RATE)
+        for index in range(3):
+            path = Path(self.folder.name) / f"image{index}.png"
+            Image.new("RGB", (16, 9), "blue").save(path)
+            app.project["assets"].append({"id": str(index), "path": str(path)})
+        app.append_all_images()
+        images = app.project["images"]
+        self.assertEqual([c["asset"] for c in images], ["0", "1", "2"])
+        self.assertEqual(images[0]["start"], 0)
+        self.assertEqual(images[-1]["end"], core.total_frames(app.duration))
+        self.assertEqual(images[0]["end"], images[1]["start"])
+        self.assertEqual(images[1]["end"], images[2]["start"])
+        app.append_all_images()
+        self.assertEqual(len(images), 3)
+        app.undo_action()
+        self.assertEqual(app.project["images"], [])
+
+
+    def test_export_folder_selection_is_saved_and_restored(self):
+        app = EditorApp(self.root)
+        app.project["audio_assets"] = [{"id": "audio", "path": "test.wav", "samples": 48000}]
+        app.project["audio_clips"] = [{"id": "music", "asset": "audio", "start_sample": 0,
+                                       "source_in": 0, "source_out": 48000}]
+        app.audio_cache["audio"] = {"pcm": "", "bins": [], "samples": 48000}
+        self.root.deiconify()
+        self.settle()
+        app._refresh()
+        folder = Path(self.folder.name) / "영상 저장"
+        folder.mkdir()
+        with patch("editor_ui.messagebox.askyesno", return_value=True):
+            app.start_export()
+        with patch("editor_ui.filedialog.askdirectory", return_value=str(folder)):
+            app._browse_export_folder()
+        saved = json.loads(app.ui_settings_file.read_text(encoding="utf-8"))
+        self.assertEqual(saved["export_folder"], str(folder))
+        app._close_export_dialog()
+        app.last_export_folder = None
+        app._restore_ui_settings()
+        app.project_file = Path(self.folder.name) / "다른 프로젝트.json"
+        with patch("editor_ui.messagebox.askyesno", return_value=True):
+            app.start_export()
+        self.assertEqual(app.export_folder_var.get(), str(folder))
+        # Manually entered folders must also persist when starting an export.
+        app.export_folder_var.set(self.folder.name)
+        with patch.object(app, "_begin_export") as begin:
+            app._export_from_dialog()
+        begin.assert_called_once()
+        saved = json.loads(app.ui_settings_file.read_text(encoding="utf-8"))
+        self.assertEqual(saved["export_folder"], self.folder.name)
+        app.export_folder_var.set(str(folder / "없는 폴더"))
+        with patch.object(app, "_begin_export") as begin:
+            app._export_from_dialog()
+        begin.assert_not_called()
+        self.assertEqual(app.last_export_folder, self.folder.name)
+        app._close_export_dialog()
+
+    def test_missing_export_folder_falls_back_to_project_folder(self):
+        self.settings({"export_folder": str(Path(self.folder.name) / "없는 폴더")})
+        app = EditorApp(self.root)
+        app.project_file = Path(self.folder.name) / "프로젝트.json"
+        app.project["audio_assets"] = [{"id": "audio", "path": "test.wav", "samples": 48000}]
+        app.project["audio_clips"] = [{"id": "music", "asset": "audio", "start_sample": 0,
+                                       "source_in": 0, "source_out": 48000}]
+        app.audio_cache["audio"] = {"pcm": "", "bins": [], "samples": 48000}
+        app._refresh()
+        with patch("editor_ui.messagebox.askyesno", return_value=True):
+            app.start_export()
+        self.assertEqual(app.export_folder_var.get(), self.folder.name)
+        app._close_export_dialog()
+
     def test_audio_track_uses_available_height_and_black_preview_is_explained(self):
         app = EditorApp(self.root)
         app.project["audio_assets"] = [{"id": "audio", "path": "test.wav", "samples": 480000}]

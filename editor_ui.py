@@ -31,6 +31,7 @@ UI_COLORS = {
     "image_clip": "#E8F3FB", "image_clip_top": "#4B84AE",
     "text_clip": "#F3EBF6", "text_clip_top": "#9265A0",
     "audio_clip": "#E5F4EF", "audio_clip_top": "#319D77", "waveform": "#238B68",
+    "video_clip": "#EDEBFB", "video_clip_top": "#7661BD",
     "playhead": "#B45309", "dark_text": "#E7EAF1", "dark_muted": "#AEB7C7",
     "success": "#10B981", "warning": "#F59E0B",
     "error": "#EF4444",
@@ -155,11 +156,15 @@ class EditorApp:
 
     def _restore_ui_settings(self):
         self.saved_panes = None
+        self.last_export_folder = None
         try:
             settings_file = self.ui_settings_file if self.ui_settings_file.is_file() else self.legacy_ui_settings_file
             data = json.loads(settings_file.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 return
+            folder = data.get("export_folder")
+            if isinstance(folder, str) and folder:
+                self.last_export_folder = folder
             self.saved_panes = data.get("panes", None)
             geometry = data.get("geometry", "")
             size = re.fullmatch(r"(\d+)x(\d+)(?:[+-]\d+[+-]\d+)?", geometry) if isinstance(geometry, str) else None
@@ -179,7 +184,8 @@ class EditorApp:
         try:
             self.ui_settings_file.parent.mkdir(parents=True, exist_ok=True)
             positions = [self.body.sashpos(0), self.body.sashpos(1), self.workspace.sashpos(0)] if len(self.body.panes()) == 3 else None
-            self.ui_settings_file.write_text(json.dumps({"geometry": self.root.geometry(), "panes": positions}), encoding="utf-8")
+            self.ui_settings_file.write_text(json.dumps({"geometry": self.root.geometry(), "panes": positions,
+                                                        "export_folder": self.last_export_folder}), encoding="utf-8")
         except OSError:
             pass
 
@@ -235,8 +241,12 @@ class EditorApp:
         left = self.left
         self._panel_heading(left, "프로젝트")
         tools = ttk.Frame(left, style="Panel.TFrame", padding=(8, 4)); tools.pack(fill="x")
-        ttk.Button(tools, text="+ 음악", command=self.choose_audio).pack(side="left")
-        ttk.Button(tools, text="+ 이미지", command=self.add_assets).pack(side="left", padx=5)
+        ttk.Button(tools, text="+ 음악", width=6, command=self.choose_audio).grid(row=0,column=0,sticky="ew")
+        ttk.Button(tools, text="+ 이미지", width=6, command=self.add_assets).grid(row=0,column=1,sticky="ew",padx=4)
+        if hasattr(self, "choose_video"):
+            ttk.Button(tools, text="+ 영상", width=6, command=self.choose_video).grid(row=0,column=2,sticky="ew")
+        for column in range(3 if hasattr(self,"choose_video") else 2):
+            tools.columnconfigure(column,weight=1,uniform="import")
         self.audio_info = ttk.Label(left, text="음악을 가져오세요", style="Muted.TLabel", padding=(10, 8))
         self.audio_info.pack(fill="x")
         ttk.Separator(left).pack(fill="x")
@@ -254,7 +264,7 @@ class EditorApp:
         self.library_window = self.library_canvas.create_window((0, 0), window=self.library_frame, anchor="nw")
         self.library_frame.bind("<Configure>", lambda e: self.library_canvas.configure(scrollregion=self.library_canvas.bbox("all")))
         self.library_canvas.bind("<Configure>", lambda e: self.library_canvas.itemconfigure(self.library_window, width=e.width))
-        ttk.Button(left, text="선택 이미지를 재생 위치에 추가", command=self.add_selected_asset).pack(fill="x", padx=8, pady=8)
+        ttk.Button(left, text="선택 미디어를 재생 위치에 추가", command=self.add_selected_asset).pack(fill="x", padx=8, pady=8)
         center = ttk.Frame(body, style="Panel.TFrame")
         body.add(center, weight=5)
         preview_bar = self._panel_heading(center, "미리보기")
@@ -425,6 +435,7 @@ class EditorApp:
             ("파일", (("새 프로젝트", self.new_project), ("열기", self.open_project),
                     ("저장", self.save_project), ("다른 이름으로 저장", self.save_as),
                     ("음악 가져오기", self.choose_audio), ("이미지 가져오기", self.add_assets),
+                    *((("영상 가져오기", self.choose_video),) if hasattr(self, "choose_video") else ()),
                     ("MP4 내보내기", self.start_export))),
             ("편집", (("실행 취소", self.undo_action), ("다시 실행", self.redo_action),
                     ("복제", self.duplicate_selected), ("삭제", self.delete_selected))),
@@ -491,7 +502,10 @@ class EditorApp:
         self.root.title(("● " if self.dirty else "") + "선율담")
 
     def _refresh_library(self):
-        self._library_signature = (tuple((a["id"], a["path"]) for a in self.project["assets"]),
+        videos = self.project.get("video_assets", [])
+        cache = getattr(self, "video_cache", {})
+        self._library_signature = (tuple((a["id"], a["path"], a["id"] in cache)
+                                        for a in self.project["assets"] + videos),
                                    self.project_search.get(), self.library_view.get())
         for child in self.library_frame.winfo_children(): child.destroy()
         self.thumb_refs.clear()
@@ -499,7 +513,7 @@ class EditorApp:
         query = self.project_search.get().casefold().strip()
         icon_view = self.library_view.get() == "썸네일"
         shown = 0
-        for a in self.project["assets"]:
+        for a in self.project["assets"] + videos:
             if query and query not in Path(a["path"]).name.casefold(): continue
             selected = a["id"] == self.library_selection
             row = ttk.Frame(self.library_frame, padding=8,
@@ -511,7 +525,7 @@ class EditorApp:
             shown += 1
             try:
                 from PIL import Image, ImageOps
-                path = Path(a["path"])
+                path = Path(cache[a["id"]]["thumbnail"] if a in videos else a["path"])
                 key = (str(path), path.stat().st_mtime_ns, icon_view)
                 photo = self.thumbnail_cache.get(key)
                 if photo is None:
@@ -526,10 +540,12 @@ class EditorApp:
                 thumb = ttk.Label(row, image=photo,
                                   style="Selected.TLabel" if selected else "TLabel")
             except Exception:
-                thumb = ttk.Label(row, text="이미지 없음", width=10,
+                thumb = ttk.Label(row, text="영상 준비 중" if a in videos else "이미지 없음", width=10,
                                   style="Selected.TLabel" if selected else "TLabel")
             thumb.pack(side="top" if icon_view else "left")
-            label = ttk.Label(row, text=Path(a["path"]).name, wraplength=108 if icon_view else 165,
+            label = ttk.Label(row, text=(("▷ " + Path(a["path"]).name + "\n" +
+                                         (clock(a.get("frames", 0)/core.FPS) if a["id"] in cache else "준비 필요"))
+                                        if a in videos else Path(a["path"]).name), wraplength=108 if icon_view else 165,
                               style="Selected.TLabel" if selected else "TLabel")
             label.pack(side="top" if icon_view else "left", padx=5)
             for widget in (row, thumb, label):
@@ -542,7 +558,7 @@ class EditorApp:
         self.library_frame.columnconfigure(0, weight=1)
         self.library_frame.columnconfigure(1, weight=1)
         if not shown and query:
-            ttk.Label(self.library_frame, text="일치하는 이미지가 없습니다.",
+            ttk.Label(self.library_frame, text="일치하는 미디어가 없습니다.",
                       style="Muted.TLabel").grid(row=0, column=0, columnspan=2, padx=10, pady=10)
 
     def _confirm_dirty(self):
@@ -1274,9 +1290,9 @@ class EditorApp:
             self.open_file.pack_forget(); self.open_folder.pack_forget()
 
     def start_export(self):
-        if self.exporting or not self.project["audio"] or not self.duration:
+        if self.exporting or not self.duration:
             messagebox.showwarning("내보내기", "먼저 음악을 선택하고 분석이 끝날 때까지 기다리세요."); return
-        if not self.project["images"]:
+        if not self.project["images"] and not self.project.get("videos"):
             if not messagebox.askyesno("검은 화면", "이미지가 없습니다. 검은 화면과 텍스트로 영상을 만들까요?"): return
         if self.export_dialog and self.export_dialog.winfo_exists():
             self.export_dialog.lift(); return
@@ -1291,6 +1307,8 @@ class EditorApp:
         self.export_heading = ttk.Label(body, text="MP4 내보내기", style="PanelTitle.TLabel")
         self.export_heading.pack(anchor="w", pady=(0, 12))
         default_folder = self.project_file.parent if self.project_file else Path.home() / "Videos"
+        if self.last_export_folder and Path(self.last_export_folder).is_dir():
+            default_folder = Path(self.last_export_folder)
         self.export_folder_var = tk.StringVar(value=str(default_folder))
         self.export_name_var = tk.StringVar(value=(self.project_file.stem if self.project_file else "음악 영상") + ".mp4")
         self.export_form = ttk.Frame(body, style="Panel.TFrame")
@@ -1331,7 +1349,14 @@ class EditorApp:
 
     def _browse_export_folder(self):
         path = filedialog.askdirectory(parent=self.export_dialog, initialdir=self.export_folder_var.get())
-        if path: self.export_folder_var.set(path)
+        if path:
+            self.export_folder_var.set(path)
+            self._remember_export_folder(path)
+
+    def _remember_export_folder(self, folder):
+        if Path(folder).is_dir():
+            self.last_export_folder = str(Path(folder).resolve())
+            self._save_ui_settings()
 
     def _close_export_dialog(self):
         if self.exporting:
@@ -1374,6 +1399,7 @@ class EditorApp:
         path = str(Path(self.export_folder_var.get()) / name)
         if not Path(self.export_folder_var.get()).is_dir():
             self.export_status_label.configure(text="저장 폴더를 찾을 수 없습니다."); return
+        self._remember_export_folder(self.export_folder_var.get())
         self._begin_export(path)
 
     def _begin_export(self, path):

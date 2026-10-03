@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import queue
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from types import SimpleNamespace
@@ -14,12 +15,25 @@ from types import SimpleNamespace
 from PIL import Image, ImageOps, ImageTk
 
 import editor_core as core
+import video_media
 from editor_ui import EditorApp as BaseEditor, UI_COLORS, clock
 
 
 class EditorApp(BaseEditor):
     def __init__(self, root):
         self.audio_cache = {}
+        self.video_cache = {}
+        self.video_cancel = threading.Event()
+        self.video_generation_by_id = {}
+        self.video_pending = {}
+        self.video_threads = []
+        self.preview_cancel = threading.Event()
+        self.preview_requests = queue.Queue(maxsize=1)
+        self.preview_thread = None
+        self.preview_requested = None
+        self.video_preview_key = None
+        self.video_preview_picture = None
+        self.silent_playback = False
         self.audio_generation_by_id = {}
         self.audio_token = 0
         self.library_drag = None
@@ -39,6 +53,10 @@ class EditorApp(BaseEditor):
         self.text_source = ttk.Label(self.timeline.master.master.master.winfo_children()[0],
                                      text="텍스트 끌어놓기 ↘", style="Source.TLabel", cursor="hand2")
         self.text_source.pack(side="left", padx=8)
+        toolbar = self.text_source.master
+        ttk.Button(toolbar, text="이미지 모두 이어 붙이기", command=self.append_all_images).pack(side="left", padx=4)
+        ttk.Button(toolbar, text="음악 모두 이어 붙이기", command=self.append_all_audio).pack(side="left", padx=4)
+        ttk.Button(toolbar, text="영상 모두 이어 붙이기", command=self.append_all_videos).pack(side="left", padx=4)
         self.text_source.bind("<ButtonPress-1>", lambda e: self._library_start("text", None, e))
         self.preview.bind("<Alt-MouseWheel>", self._image_wheel)
         self.preview.bind("<Motion>", self._preview_hover)
@@ -70,7 +88,8 @@ class EditorApp(BaseEditor):
 
     def _refresh(self, properties=True):
         self._duration_refresh()
-        signature = (tuple((a["id"], a["path"]) for a in self.project["assets"]),
+        signature = (tuple((a["id"], a["path"], a["id"] in self.video_cache)
+                           for a in self.project["assets"] + self.project.get("video_assets", [])),
                      self.project_search.get(), self.library_view.get())
         if signature != self._library_signature: self._refresh_library()
         self._refresh_audio_list()
@@ -126,6 +145,31 @@ class EditorApp(BaseEditor):
             return super()._show_properties()
         for child in self.properties.winfo_children(): child.destroy()
         kind = self.selection[0]
+        if kind == "video":
+            asset = next((a for a in self.project["video_assets"] if a["id"] == item["asset"]), None)
+            ttk.Label(self.properties, text=Path(asset["path"]).name if asset else "영상 없음",
+                      style="PanelTitle.TLabel", wraplength=250).pack(anchor="w")
+            for label, value, key in (("타임라인 시작 (초)", item["start"]/core.FPS, "start_seconds"),
+                                      ("원본 시작 (초)", item["source_in_frame"]/core.FPS, "source_in_seconds"),
+                                      ("원본 끝 (초)", item["source_out_frame"]/core.FPS, "source_out_seconds")):
+                self._prop_entry(label, f"{value:.3f}", key)
+            ttk.Label(self.properties, text=f"타임라인 끝 {clock(item['end']/core.FPS)}").pack(anchor="w", pady=4)
+            actions = ttk.Frame(self.properties); actions.pack(fill="x", pady=6)
+            ttk.Button(actions, text="뒤로 보내기", command=lambda: self._move_image_layer(-1)).pack(side="left")
+            ttk.Button(actions, text="앞으로 가져오기", command=lambda: self._move_image_layer(1)).pack(side="left", padx=4)
+            for label, key in (("가로 중심", "image_x"), ("세로 중심", "image_y"), ("배율 %", "image_zoom")):
+                self._prop_entry(label, str(item["from"][key[6:]]), key)
+            presets = ttk.Frame(self.properties); presets.pack(fill="x", pady=5)
+            for label, preset in (("화면 맞춤", "fit"), ("화면 채움", "fill")):
+                ttk.Button(presets, text=label, command=lambda p=preset: self._image_preset(p)).pack(side="left", padx=2)
+            enabled = tk.BooleanVar(value=item.get("audio_enabled", False))
+            ttk.Checkbutton(self.properties, text="원본 소리 켜기", variable=enabled,
+                            state="normal" if asset and asset.get("has_audio") else "disabled",
+                            command=lambda: self._commit("audio_enabled", enabled.get(), item["id"])).pack(anchor="w", pady=6)
+            self._prop_entry("원본 소리 음량 % (0~200)", str(round(item.get("audio_gain", 1)*100)), "video_gain")
+            for label, key in (("페이드 인 (초)", "fade_in_seconds"), ("페이드 아웃 (초)", "fade_out_seconds")):
+                self._prop_entry(label, f"{item.get(key.replace('seconds','samples'),0)/core.RATE:.3f}", key)
+            return
         if kind == "audio":
             asset = next((a for a in self.project["audio_assets"] if a["id"] == item["asset"]), None)
             ttk.Label(self.properties, text=Path(asset["path"]).name if asset else "음원 없음",
@@ -133,6 +177,10 @@ class EditorApp(BaseEditor):
             self._prop_entry("타임라인 시작 (초)", f"{item['start_sample']/core.RATE:.3f}", "start_seconds")
             self._prop_entry("원본 시작 (초)", f"{item['source_in']/core.RATE:.3f}", "source_in_seconds")
             self._prop_entry("원본 끝 (초)", f"{item['source_out']/core.RATE:.3f}", "source_out_seconds")
+            self._prop_entry("페이드 인 (초)", f"{item.get('fade_in_samples', 0)/core.RATE:.3f}", "fade_in_seconds")
+            self._prop_entry("페이드 아웃 (초)", f"{item.get('fade_out_samples', 0)/core.RATE:.3f}", "fade_out_seconds")
+            ttk.Label(self.properties, text="0초로 설정하면 페이드를 끕니다. 짧은 클립에서는 클립 길이까지만 적용합니다.",
+                      style="Muted.TLabel", wraplength=245).pack(anchor="w", pady=6)
             return
         asset = next((a for a in self.project["assets"] if a["id"] == item["asset"]), None)
         ttk.Label(self.properties, text=Path(asset["path"]).name if asset else "이미지 없음",
@@ -213,12 +261,36 @@ class EditorApp(BaseEditor):
             return super()._commit(key, raw, selected_id)
         trial = copy.deepcopy(item)
         try:
-            if kind == "audio":
+            if kind == "video":
+                asset = next(a for a in self.project["video_assets"] if a["id"] == item["asset"])
+                if key == "audio_enabled": trial[key] = bool(raw) and asset.get("has_audio", False)
+                else:
+                    value = float(raw)
+                    if not math.isfinite(value): raise ValueError("유한한 숫자를 입력하세요.")
+                    if key == "start_seconds": trial["start"] = max(0, round(value*core.FPS))
+                    elif key in ("source_in_seconds", "source_out_seconds"):
+                        trial[key.replace("seconds", "frame")] = round(value*core.FPS)
+                    elif key == "video_gain":
+                        if not 0 <= value <= 200: raise ValueError("음량은 0~200%입니다.")
+                        trial["audio_gain"] = value/100
+                    elif key in ("fade_in_seconds", "fade_out_seconds"):
+                        if value < 0: raise ValueError("페이드는 0초 이상입니다.")
+                        trial[key.replace("seconds", "samples")] = round(value*core.RATE)
+                    elif key in ("image_x", "image_y", "image_zoom"):
+                        trial["from"][key[6:]] = max(10, min(500, value)) if key == "image_zoom" else value
+                        trial["to"] = dict(trial["from"])
+                    else: return
+                trial["end"] = core.video_end(trial)
+                if not core.valid_video(self.project, trial): raise ValueError("원본 사용 구간이 잘못되었습니다.")
+            elif kind == "audio":
                 asset = next(a for a in self.project["audio_assets"] if a["id"] == item["asset"])
                 value = round(float(raw) * core.RATE)
                 if key == "start_seconds": trial["start_sample"] = max(0, value)
                 elif key == "source_in_seconds": trial["source_in"] = max(0, value)
                 elif key == "source_out_seconds": trial["source_out"] = min(asset.get("samples", 0), value)
+                elif key in ("fade_in_seconds", "fade_out_seconds"):
+                    if value < 0: raise ValueError("페이드 시간은 0초 이상이어야 합니다.")
+                    trial[key.replace("seconds", "samples")] = value
                 else: return
                 if not core.valid_audio(self.project, trial, item["id"]): raise ValueError("음원 사용 구간이 잘못되었습니다.")
             else:
@@ -234,54 +306,61 @@ class EditorApp(BaseEditor):
                 else: return
             if trial != item:
                 self._change(); item.update(trial); self._refresh()
-        except (ValueError, StopIteration) as e:
+        except (ValueError, OverflowError, StopIteration) as e:
             messagebox.showerror("입력 오류", "시간과 겹침을 확인하세요.\n" + str(e))
 
     def _selected(self):
         if not self.selection: return None
         kind, ident = self.selection
         table = {"image": self.project["images"], "audio": self.project["audio_clips"],
+                 "video": self.project.get("videos", []),
                  "text": self.project["texts"]}
         return next((item for item in table[kind] if item["id"] == ident), None)
 
     def _image_preset(self, preset):
         item = self._selected()
-        if not item or self.selection[0] != "image": return
+        if not item or self.selection[0] not in ("image", "video"): return
         trial = copy.deepcopy(item)
-        state = trial[self.motion_key.get()]
+        state = trial["from" if self.selection[0] == "video" else self.motion_key.get()]
         if preset in ("fit", "reset"):
             state.update(x=960, y=540, zoom=100)
             trial.pop("legacy_native", None)
         elif preset == "center": state.update(x=960, y=540)
         else:
-            asset = next(a for a in self.project["assets"] if a["id"] == item["asset"])
-            from PIL import Image, ImageOps
-            with Image.open(asset["path"]) as source:
-                image = ImageOps.exif_transpose(source)
-                ratio = max(core.SIZE[0] / image.width, core.SIZE[1] / image.height)
-                fit = min(core.SIZE[0] / image.width, core.SIZE[1] / image.height)
-                state.update(x=960, y=540, zoom=min(500, ratio / fit * 100))
-                trial.pop("legacy_native", None)
+            if self.selection[0] == "video":
+                asset = next(a for a in self.project["video_assets"] if a["id"] == item["asset"])
+                width, height = asset["width"], asset["height"]
+            else:
+                asset = next(a for a in self.project["assets"] if a["id"] == item["asset"])
+                with Image.open(asset["path"]) as source:
+                    width, height = ImageOps.exif_transpose(source).size
+            ratio = max(core.SIZE[0] / width, core.SIZE[1] / height)
+            fit = min(core.SIZE[0] / width, core.SIZE[1] / height)
+            state.update(x=960, y=540, zoom=min(500, ratio / fit * 100))
+            trial.pop("legacy_native", None)
         if preset == "reset":
             trial["from"] = dict(state); trial["to"] = dict(state); trial["motion"] = False
+        if self.selection[0] == "video": trial["to"] = dict(trial["from"])
         if trial != item:
             self._change(); item.update(trial); self._refresh()
 
     def _move_image_layer(self, direction):
         item = self._selected()
-        if not item or self.selection[0] != "image" or not self._editable(): return
-        images = self.project["images"]
+        if not item or self.selection[0] not in ("image", "video") or not self._editable(): return
+        images = core.visual_clips(self.project)
         index = images.index(item)
         other = index + direction
         if not 0 <= other < len(images): return
         self._change()
         images[index], images[other] = images[other], images[index]
+        for index, clip in enumerate(images): clip["order"] = index
+        self.project["images"] = [c for c in images if "source_in_frame" not in c]
         self._refresh()
 
     def _image_wheel(self, event):
         item = self._selected()
-        if not item or self.selection[0] != "image": return
-        key = self.motion_key.get()
+        if not item or self.selection[0] not in ("image", "video"): return
+        key = "from" if self.selection[0] == "video" else self.motion_key.get()
         value = item[key]["zoom"] * (1.08 if event.delta > 0 else 1/1.08)
         self._commit("image_zoom", value, item["id"])
         return "break"
@@ -290,6 +369,144 @@ class EditorApp(BaseEditor):
         if self.play_thread and self.play_thread.is_alive():
             self.play_stop.set(); self.play_thread.join(timeout=2)
         self.audio_cache.clear()
+
+    def choose_video(self):
+        if not self._editable(): return
+        paths = filedialog.askopenfilenames(filetypes=[("영상", "*.mp4 *.mov *.mkv *.webm")])
+        known = {str(Path(a["path"]).resolve()).casefold() for a in self.project["video_assets"]}
+        added = []
+        for path in paths:
+            resolved = str(Path(path).resolve())
+            if resolved.casefold() in known: continue
+            if Path(path).suffix.lower() not in core.VIDEO_EXTS or not Path(path).is_file(): continue
+            added.append({"id": core.uid(), "path": resolved})
+            known.add(resolved.casefold())
+        if not added: return
+        self._commit_text_draft(); self._change()
+        self.project["video_assets"].extend(added)
+        for asset in added: self._prepare_video(asset)
+        self._refresh()
+
+    def _prepare_video(self, asset):
+        if asset["id"] in self.video_pending: return
+        try: ffmpeg, ffprobe = self.tool("ffmpeg"), self.tool("ffprobe")
+        except core.EditorError as e: messagebox.showerror("영상 오류", str(e)); return
+        if self.video_cancel.is_set(): self.video_cancel = threading.Event()
+        self.audio_token += 1
+        token = self.audio_token
+        self.video_generation_by_id[asset["id"]] = token
+        self.video_pending[asset["id"]] = token
+        cancel = self.video_cancel
+        ident, path = asset["id"], asset["path"]
+        self.cancel_button.configure(state="normal")
+        self.progressbar.configure(mode="indeterminate"); self.progressbar.start(12)
+        self._show_job_controls(running=True)
+        self.status.set("영상 미리보기 준비 중… " + Path(path).name)
+        def worker():
+            try:
+                prepared = video_media.prepare_video(path, ffmpeg, ffprobe, cancel)
+                self.events.put(("video_ready", ident, token, prepared))
+            except Exception as e:
+                self.events.put(("video_error", ident, token, str(e)))
+        thread = threading.Thread(target=worker, daemon=True)
+        self.video_threads = [t for t in self.video_threads if t.is_alive()]
+        self.video_threads.append(thread); thread.start()
+
+    def _recheck_videos(self):
+        for asset in self.project.get("video_assets", []):
+            if asset["id"] in self.video_cache:
+                self._video_metadata(asset, self.video_cache[asset["id"]])
+            else: self._prepare_video(asset)
+
+    @staticmethod
+    def _video_metadata(asset, prepared):
+        asset.update({key:prepared[key] for key in ("width","height","frames","video_stream","audio_stream",
+                                                   "has_audio","rotation","video_start","audio_start")})
+
+    def _video_job_finished(self, ident):
+        self.video_pending.pop(ident, None)
+        if self.video_pending:
+            self.progressbar.configure(mode="indeterminate"); self.progressbar.start(12)
+            self.cancel_button.configure(state="normal"); self._show_job_controls(running=True)
+        else:
+            self.progressbar.stop(); self.cancel_button.configure(state="disabled"); self._show_job_controls()
+
+    def place_video(self, asset_id, frame):
+        if not self._editable(): return
+        asset = next((a for a in self.project["video_assets"] if a["id"] == asset_id), None)
+        if not asset or asset_id not in self.video_cache:
+            self.status.set("영상 준비가 끝난 뒤 배치하세요."); return
+        self._commit_text_draft(); self._change()
+        clip = core.video_defaults(asset_id, max(0, int(frame)), asset["frames"])
+        clip["order"] = core.next_visual_order(self.project)
+        self.project["videos"].append(clip)
+        self.selection = ("video", clip["id"]); self._refresh()
+
+    def append_all_videos(self):
+        if not self._editable(): return
+        placed = {c["asset"] for c in self.project["videos"]}
+        assets = [a for a in self.project["video_assets"] if a["id"] not in placed]
+        if not assets: self.status.set("이어 붙일 영상이 없습니다."); return
+        if any(a["id"] not in self.video_cache for a in assets):
+            self.status.set("모든 영상 준비가 끝난 뒤 이어 붙이세요."); return
+        self._commit_text_draft(); self._change()
+        start = max((c["end"] for c in core.visual_clips(self.project)), default=0)
+        for asset in assets:
+            clip = core.video_defaults(asset["id"], start, asset["frames"])
+            clip["order"] = core.next_visual_order(self.project)
+            self.project["videos"].append(clip); start = clip["end"]
+        self.selection = ("video", clip["id"]); self._refresh()
+
+    def _dispose_videos(self):
+        self.video_cancel.set(); self.preview_cancel.set()
+        self.video_generation_by_id.clear()
+        self.video_pending.clear()
+        if self.preview_thread: self.preview_thread.join(timeout=3)
+        for thread in self.video_threads: thread.join(timeout=3)
+        self.video_threads.clear(); self.video_cache.clear()
+        self.preview_thread = None
+        self.preview_requests = queue.Queue(maxsize=1)
+        self.preview_cancel = threading.Event()
+        self.preview_requested = None; self.video_preview_key = None; self.video_preview_picture = None
+
+    def _request_video_preview(self, key, frame):
+        if key == self.preview_requested: return
+        assets = []
+        for asset in self.project["video_assets"]:
+            cache = self.video_cache.get(asset["id"])
+            if cache: assets.append(dict(asset, **cache))
+        if any(c["asset"] not in self.video_cache for c in core.active_visuals(self.project, frame)
+               if "source_in_frame" in c): return
+        if not self.preview_thread or not self.preview_thread.is_alive():
+            ffmpeg = self.tool("ffmpeg")
+            cancel, requests = self.preview_cancel, self.preview_requests
+            def worker():
+                provider = None; signature = None
+                try:
+                    while not cancel.is_set():
+                        try: request_key, snapshot, number, prepared = requests.get(timeout=.1)
+                        except queue.Empty: continue
+                        new_signature = tuple((a["id"], a["path"], a["proxy"]) for a in prepared)
+                        if new_signature != signature:
+                            if provider: provider.close()
+                            provider = video_media.VideoFrameProvider(prepared, ffmpeg, cancel, preview=True)
+                            signature = new_signature
+                        try:
+                            picture = core.render_scene(snapshot, number, video_frames=provider)
+                            self.events.put(("video_preview", request_key, picture))
+                        except Exception as e:
+                            if not cancel.is_set(): self.events.put(("video_preview_error", request_key, str(e)))
+                finally:
+                    if provider: provider.close()
+            self.preview_thread = threading.Thread(target=worker, daemon=True); self.preview_thread.start()
+        self.preview_requested = key
+        try: self.preview_requests.get_nowait()
+        except queue.Empty: pass
+        self.preview_requests.put_nowait((key, copy.deepcopy(self.project), frame, assets))
+
+    def cancel_job(self):
+        if not self.exporting: self.video_cancel.set()
+        super().cancel_job()
 
     def choose_audio(self):
         if not self._editable(): return
@@ -357,7 +574,8 @@ class EditorApp(BaseEditor):
     def _library_down(self, ident):
         self._commit_text_draft()
         self.library_selection = ident
-        self._library_start("image", ident, None)
+        kind = "video" if any(a["id"] == ident for a in self.project["video_assets"]) else "image"
+        self._library_start(kind, ident, None)
         self._refresh_library()
         self._show_properties()
 
@@ -383,8 +601,8 @@ class EditorApp(BaseEditor):
             if y < 30: t.yview_scroll(-1,"units")
             elif y > t.winfo_height()-30: t.yview_scroll(1,"units")
             drag["frame"] = self._x_to_frame(t.canvasx(x))
-            drag["valid"] = self._track_at(t.canvasy(y)) == drag["kind"] and (
-                drag["kind"] == "audio" or self.duration > 0)
+            drag["valid"] = self._track_at(t.canvasy(y)) == ("image" if drag["kind"] == "video" else drag["kind"]) and (
+                drag["kind"] in ("audio", "video") or self.duration > 0)
             frame = drag["frame"]
             if drag["kind"] == "audio":
                 asset = next((a for a in self.project["audio_assets"] if a["id"] == drag["id"]), None)
@@ -392,6 +610,11 @@ class EditorApp(BaseEditor):
                     drag["trial"] = {"start_sample": round(frame*core.RATE/core.FPS),
                                      "source_in": 0, "source_out": asset["samples"]}
                     drag["valid"] = drag["valid"] and core.valid_audio(self.project, drag["trial"])
+                else: drag["valid"] = False
+            elif drag["kind"] == "video":
+                asset = next((a for a in self.project["video_assets"] if a["id"] == drag["id"]), None)
+                if asset and drag["id"] in self.video_cache:
+                    drag["trial"] = core.video_defaults(asset["id"], frame, asset["frames"])
                 else: drag["valid"] = False
             elif drag["kind"] == "image":
                 drag["trial"] = {"start": frame, "end": min(core.total_frames(self.duration),
@@ -414,10 +637,16 @@ class EditorApp(BaseEditor):
         if not drag or not drag["active"] or not drag["valid"]: self.draw_timeline(); return
         frame = drag["frame"]
         if drag["kind"] == "image": self.place_asset(drag["id"], frame)
+        elif drag["kind"] == "video": self.place_video(drag["id"], frame)
         elif drag["kind"] == "audio": self.place_audio(drag["id"], frame)
         else: self.add_text(frame)
 
     def add_selected_asset(self):
+        if any(a["id"] == self.library_selection for a in self.project["video_assets"]):
+            if self.library_selection not in self.video_cache:
+                asset = next(a for a in self.project["video_assets"] if a["id"] == self.library_selection)
+                self._prepare_video(asset); return
+            self.place_video(self.library_selection, round(self.position*core.FPS)); return
         if self.library_selection and self.duration:
             self.place_asset(self.library_selection, round(self.position * core.FPS))
 
@@ -427,6 +656,7 @@ class EditorApp(BaseEditor):
         if end <= start: return
         self._commit_text_draft(); self._change()
         clip = core.image_defaults(asset_id, start, end)
+        clip["order"] = core.next_visual_order(self.project)
         self.project["images"].append(clip)
         self.selection = ("image", clip["id"]); self.seek(start / core.FPS); self._refresh()
 
@@ -435,13 +665,50 @@ class EditorApp(BaseEditor):
         asset = next((a for a in self.project["audio_assets"] if a["id"] == asset_id), None)
         if not asset or asset_id not in self.audio_cache:
             self.status.set("음원 분석이 끝난 뒤 배치할 수 있습니다."); return
-        clip = {"id": core.uid(), "asset": asset_id,
-                "start_sample": max(0, int(frame * core.RATE / core.FPS)),
-                "source_in": 0, "source_out": int(asset["samples"])}
+        clip = core.audio_defaults(asset_id, max(0, int(frame * core.RATE / core.FPS)), asset["samples"])
         if not core.valid_audio(self.project, clip): return
         self._commit_text_draft(); self._change()
         self.project["audio_clips"].append(clip)
         self.selection = ("audio", clip["id"]); self._refresh()
+
+    def append_all_audio(self):
+        if not self._editable() or not self.project["audio_assets"]: return
+        placed = {c["asset"] for c in self.project["audio_clips"]}
+        assets = [a for a in self.project["audio_assets"] if a["id"] not in placed]
+        if not assets:
+            self.status.set("모든 음악이 이미 타임라인에 배치되어 있습니다."); return
+        if any(a["id"] not in self.audio_cache for a in assets):
+            self.status.set("모든 음원 분석이 끝난 뒤 이어 붙일 수 있습니다."); return
+        self._commit_text_draft(); self._change()
+        start = max((core.audio_end(c) for c in self.project["audio_clips"]), default=0)
+        for asset in assets:
+            clip = core.audio_defaults(asset["id"], start, asset["samples"])
+            self.project["audio_clips"].append(clip)
+            start = core.audio_end(clip)
+        self.selection = ("audio", clip["id"])
+        self._refresh()
+        self.status.set(f"음악 {len(assets)}개를 타임라인 끝에 이어 붙였습니다.")
+
+    def append_all_images(self):
+        if not self._editable() or not self.project["assets"]: return
+        start = max((c["end"] for c in self.project["images"]), default=0)
+        end = core.total_frames(self.duration)
+        placed = {c["asset"] for c in self.project["images"]}
+        assets = [a for a in self.project["assets"] if a["id"] not in placed]
+        if not assets:
+            self.status.set("모든 이미지가 이미 타임라인에 배치되어 있습니다."); return
+        if end - start < len(assets):
+            self.status.set("이미지를 이어 붙일 시간이 부족합니다. 음악을 추가하거나 이미지 구간을 줄이세요."); return
+        self._commit_text_draft(); self._change()
+        for index, asset in enumerate(assets):
+            begin = start + (end - start) * index // len(assets)
+            finish = start + (end - start) * (index + 1) // len(assets)
+            clip = core.image_defaults(asset["id"], begin, finish)
+            clip["order"] = core.next_visual_order(self.project)
+            self.project["images"].append(clip)
+        self.selection = ("image", clip["id"])
+        self._refresh()
+        self.status.set(f"이미지 {len(assets)}개를 남은 영상 구간에 같은 길이로 이어 붙였습니다.")
 
     def add_text(self, frame=None):
         if not self._editable() or not self.duration: return
@@ -462,6 +729,7 @@ class EditorApp(BaseEditor):
         item = self._selected()
         if not item or not self._editable(): return
         collection = {"audio": self.project["audio_clips"], "image": self.project["images"],
+                      "video": self.project["videos"],
                       "text": self.project["texts"]}[self.selection[0]]
         self._change(); collection.remove(item); self.selection = None; self._refresh()
 
@@ -478,7 +746,8 @@ class EditorApp(BaseEditor):
         else:
             duration = item["end"] - item["start"]
             trial["start"] = item["end"]; trial["end"] = item["end"] + duration
-            collection = self.project["images"] if kind == "image" else self.project["texts"]
+            collection = {"image": self.project["images"], "video": self.project["videos"], "text": self.project["texts"]}[kind]
+            if kind in ("image", "video"): trial["order"] = core.next_visual_order(self.project)
             valid = trial["start"] >= 0 and trial["end"] > trial["start"]
             if kind == "text": trial["order"] = max((t.get("order",0) for t in collection), default=0)+1
         if not valid:
@@ -489,13 +758,13 @@ class EditorApp(BaseEditor):
         self._commit_text_draft()
         if not self.undo or not self._editable(): return
         self.redo.append(copy.deepcopy(self.project)); self.project = self.undo.pop()
-        self.dirty = True; self.selection = None; self.revision += 1; self._refresh(); self._recheck_audio()
+        self.dirty = True; self.selection = None; self.revision += 1; self._recheck_videos(); self._refresh(); self._recheck_audio()
 
     def redo_action(self):
         self._commit_text_draft()
         if not self.redo or not self._editable(): return
         self.undo.append(copy.deepcopy(self.project)); self.project = self.redo.pop()
-        self.dirty = True; self.selection = None; self.revision += 1; self._refresh(); self._recheck_audio()
+        self.dirty = True; self.selection = None; self.revision += 1; self._recheck_videos(); self._refresh(); self._recheck_audio()
 
     def save_project(self):
         self._commit_text_draft()
@@ -506,7 +775,7 @@ class EditorApp(BaseEditor):
     def save_as(self):
         self._commit_text_draft()
         path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("프로젝트 JSON", "*.json")],
-                 initialfile=(self.project_file.stem + "_v2.json" if self.project_file and self.project.get("_migrated") else None))
+                 initialfile=(self.project_file.stem + "_v3.json" if self.project_file and self.project.get("_migrated") else None))
         if not path: return False
         previous = self.project_file; self.project_file = Path(path)
         if self.save_project(): self.project.pop("_migrated", None); return True
@@ -516,6 +785,7 @@ class EditorApp(BaseEditor):
         self._commit_text_draft()
         if not self._editable() or not self._confirm_dirty(): return
         self._stop_audio(); self.audio_cancel.set(); self._dispose_pcm()
+        self._dispose_videos()
         self.audio_cancel = threading.Event()
         self.project = core.fresh(); self.project_file = None; self.duration = 0; self.position = 0
         self.undo.clear(); self.redo.clear(); self.selection = None; self.library_selection = None
@@ -532,19 +802,21 @@ class EditorApp(BaseEditor):
             missing = core.missing_media(data)
             for kind, asset_id, old in missing:
                 messagebox.showinfo("파일 다시 연결", f"파일을 찾을 수 없습니다:\n{old}\n\n다시 선택하세요.")
-                types = [("음악", "*.flac *.wav *.mp3")] if kind == "audio" else [("이미지", "*.jpg *.jpeg *.png")]
+                types = {"audio": [("음악", "*.flac *.wav *.mp3")], "image": [("이미지", "*.jpg *.jpeg *.png")],
+                         "video": [("영상", "*.mp4 *.mov *.mkv *.webm")]}[kind]
                 replacement = filedialog.askopenfilename(filetypes=types)
                 if not replacement: return
-                collection = data["audio_assets"] if kind == "audio" else data["assets"]
+                collection = {"audio": data["audio_assets"], "image": data["assets"], "video": data["video_assets"]}[kind]
                 next(a for a in collection if a["id"] == asset_id)["path"] = replacement
             self._stop_audio(); self.audio_cancel.set(); self._dispose_pcm()
+            self._dispose_videos()
             self.audio_cancel = threading.Event()
             self.project = data; self.project_file = Path(path)
             self._legacy_project_file = Path(path) if data.get("_migrated") else None
             self.selection = None; self.library_selection = None
             self.undo.clear(); self.redo.clear(); self.dirty = bool(missing or data.get("_migrated"))
             self.position = 0; self.revision += 1; self.scene_cache_key = None
-            if data.get("_migrated") and data["audio_assets"]:
+            if data.get("_migrated_v1") and data["audio_assets"]:
                 asset = data["audio_assets"][0]
                 duration = core.probe_audio(asset["path"], self.tool("ffprobe"))
                 asset["samples"] = round(duration * core.RATE)
@@ -552,8 +824,8 @@ class EditorApp(BaseEditor):
                 end = core.total_frames(duration)
                 cues = sorted(data["images"], key=lambda c: c["start"])
                 if cues: cues[-1]["end"] = max(cues[-1]["start"] + 1, end)
-            self._refresh(); self._recheck_audio()
-            if data.get("_migrated"): self.status.set("v1 프로젝트를 변환했습니다. 저장 시 _v2 이름을 사용하세요.")
+            self._refresh(); self._recheck_audio(); self._recheck_videos()
+            if data.get("_migrated"): self.status.set("이전 프로젝트를 변환했습니다. 저장 시 _v3 이름을 사용하세요.")
         except core.EditorError as e: messagebox.showerror("열기 오류", str(e))
 
     def show_composition(self):
@@ -616,8 +888,9 @@ class EditorApp(BaseEditor):
         duration=self.duration
         entries=[]
         assets={a["id"]:Path(a["path"]).name for a in self.project["assets"]}
+        assets.update({a["id"]:Path(a["path"]).name for a in self.project["video_assets"]})
         audio_assets={a["id"]:Path(a["path"]).name for a in self.project["audio_assets"]}
-        for kind,items in (("image",self.project["images"]),("text",self.project["texts"]),
+        for kind,items in (("image",self.project["images"]),("video",self.project["videos"]),("text",self.project["texts"]),
                            ("audio",self.project["audio_clips"])):
             for item in items:
                 if kind=="audio":
@@ -625,18 +898,18 @@ class EditorApp(BaseEditor):
                     name=audio_assets.get(item["asset"],"누락된 음원")
                 else:
                     start,end=item["start"]/core.FPS,item["end"]/core.FPS
-                    name=assets.get(item["asset"],"누락된 이미지") if kind=="image" else item["text"].replace("\n"," ")
+                    name=assets.get(item["asset"],"누락된 미디어") if kind in ("image","video") else item["text"].replace("\n"," ")
                 entries.append((start,0,kind,item["id"],name,end,
                                 "영상 끝 초과" if end>duration+1e-6 else ""))
         image_gaps=list(self._interval_gaps(
-            ((i["start"]/core.FPS,i["end"]/core.FPS) for i in self.project["images"]),duration))
+            ((i["start"]/core.FPS,i["end"]/core.FPS) for i in core.visual_clips(self.project)),duration))
         audio_gaps=list(self._interval_gaps(
             ((core.audio_start(i)/core.RATE,core.audio_end(i)/core.RATE)
-             for i in self.project["audio_clips"]),duration))
+             for i in core.timeline_audio(self.project)),duration))
         for kind,gaps,label in (("image",image_gaps,"검은 화면"),("audio",audio_gaps,"무음")):
             for start,end in gaps:
                 if end>start: entries.append((start,1,kind,None,label,end,"빈 구간"))
-        names={"image":"이미지","text":"텍스트","audio":"음악"}
+        names={"image":"이미지","video":"영상","text":"텍스트","audio":"음악"}
         for index,(start,_,kind,ident,name,end,note) in enumerate(sorted(entries)):
             row=f"row-{index}"
             table.insert("","end",iid=row,
@@ -651,6 +924,7 @@ class EditorApp(BaseEditor):
         self.composition_summary.configure(text=(
             f"영상 {clock(duration)}  ·  음악 {len(self.project['audio_clips'])}개  ·  "
             f"이미지 {len(self.project['images'])}개  ·  텍스트 {len(self.project['texts'])}개  ·  "
+            f"영상 클립 {len(self.project['videos'])}개  ·  "
             f"검은 화면 {len(image_gaps)}곳  ·  무음 {len(audio_gaps)}곳"))
 
     def _jump_to_composition(self):
@@ -708,7 +982,7 @@ class EditorApp(BaseEditor):
         c.delete("all")
         lanes = self._text_lanes()
         rows = max(1, len(lanes))
-        image_lanes = self._media_lanes(self.project["images"],
+        image_lanes = self._media_lanes(core.visual_clips(self.project),
                                         lambda clip: clip["start"], lambda clip: clip["end"], stacked=True)
         audio_lanes = self._media_lanes(self.project["audio_clips"], core.audio_start, core.audio_end)
         self.image_y = 24 + rows * 42
@@ -716,7 +990,7 @@ class EditorApp(BaseEditor):
         height = max(c.winfo_height(), self.audio_y + len(audio_lanes) * 64)
         self.audio_track_height = height - self.audio_y
         self.audio_lane_height = self.audio_track_height / len(audio_lanes)
-        latest = max([self.duration] + [i["end"] / core.FPS for i in self.project["images"]]
+        latest = max([self.duration] + [i["end"] / core.FPS for i in core.visual_clips(self.project)]
                      + [t["end"] / core.FPS for t in self.project["texts"]])
         for drag in (self.drag,self.library_drag):
             if drag and drag.get("trial"):
@@ -748,7 +1022,7 @@ class EditorApp(BaseEditor):
         for lane, items in enumerate(image_lanes):
             top=self.image_y+(len(image_lanes)-1-lane)*58
             self._draw_track_header(top,top+58,UI_COLORS["image_clip_top"],
-                                    f"이미지 {lane+1}",len(items))
+                                    f"{'화면' if self.project['videos'] else '이미지'} {lane+1}",len(items))
         for lane, items in enumerate(audio_lanes):
             top=self.audio_y+lane*self.audio_lane_height
             self._draw_track_header(top,top+self.audio_lane_height,UI_COLORS["audio_clip_top"],
@@ -758,10 +1032,10 @@ class EditorApp(BaseEditor):
         self.track_header.yview_moveto(c.yview()[0])
         left,right = max(0,c.canvasx(0)),c.canvasx(c.winfo_width())
         for kind,intervals,y0,y1,label in (
-            ("image",((i["start"]/core.FPS,i["end"]/core.FPS) for i in self.project["images"]),
+            ("image",((i["start"]/core.FPS,i["end"]/core.FPS) for i in core.visual_clips(self.project)),
              self.image_y+6,self.image_y+52,"검은 화면"),
             ("audio",((core.audio_start(i)/core.RATE,core.audio_end(i)/core.RATE)
-                      for i in self.project["audio_clips"]),self.audio_y+6,height-6,"무음")):
+                      for i in core.timeline_audio(self.project)),self.audio_y+6,height-6,"무음")):
             for start,end in self._interval_gaps(intervals,self.duration):
                 x0,x1=start*self.zoom,end*self.zoom
                 if x1<left or x0>right: continue
@@ -795,6 +1069,13 @@ class EditorApp(BaseEditor):
         for lane, items in enumerate(image_lanes):
             y=self.image_y+(len(image_lanes)-1-lane)*58
             for clip in items:
+                if "source_in_frame" in clip:
+                    asset = next((a for a in self.project["video_assets"] if a["id"] == clip["asset"]), None)
+                    cache = self.video_cache.get(clip["asset"], {})
+                    label = ("▷ " + Path(asset["path"]).name if asset else "누락된 영상")
+                    label += " · 소리 켬" if clip.get("audio_enabled") else " · 소리 끔"
+                    self._draw_clip(clip,"video",y+6,46,UI_COLORS["video_clip"],label,cache.get("thumbnail"))
+                    continue
                 asset = next((a for a in self.project["assets"] if a["id"] == clip["asset"]), None)
                 name = Path(asset["path"]).name if asset else "누락"
                 self._draw_clip(clip,"image",y+6,46,UI_COLORS["image_clip"],name,
@@ -834,9 +1115,9 @@ class EditorApp(BaseEditor):
             trial = drag["trial"]; kind = drag["kind"]
             if kind == "audio": a,b = core.audio_start(trial)/core.RATE,core.audio_end(trial)/core.RATE
             else: a,b = trial["start"]/core.FPS,trial["end"]/core.FPS
-            y = {"text":30,"image":self.image_y+9,"audio":self.audio_y+9}[kind]
+            y = {"text":30,"image":self.image_y+9,"video":self.image_y+9,"audio":self.audio_y+9}[kind]
             track_top,track_bottom={"text":(24,self.image_y),"image":(self.image_y,self.audio_y),
-                                    "audio":(self.audio_y,height)}[kind]
+                                    "video":(self.image_y,self.audio_y),"audio":(self.audio_y,height)}[kind]
             c.create_rectangle(left,track_top,right,track_bottom,outline=UI_COLORS["success"] if drag.get("valid") else UI_COLORS["error"],
                                width=2)
             c.create_rectangle(a*self.zoom,y,b*self.zoom,y+28,fill="#4a9970" if drag.get("valid") else "#a24141",
@@ -866,10 +1147,10 @@ class EditorApp(BaseEditor):
         cursor="crosshair"
         for ident in reversed(c.find_overlapping(x-1,y-1,x+1,y+1)):
             tags=c.gettags(ident)
-            if tags and tags[0] in ("image","audio","text") and len(tags)>1:
+            if tags and tags[0] in ("image","video","audio","text") and len(tags)>1:
                 kind,clip_id=tags[:2]
                 items={"image":self.project["images"],"audio":self.project["audio_clips"],
-                       "text":self.project["texts"]}[kind]
+                       "video":self.project["videos"],"text":self.project["texts"]}[kind]
                 clip=next((item for item in items if item["id"]==clip_id),None)
                 if clip:
                     if kind=="audio": left,right=core.audio_start(clip)/core.RATE*self.zoom,core.audio_end(clip)/core.RATE*self.zoom
@@ -926,7 +1207,7 @@ class EditorApp(BaseEditor):
         value=max(0,int(value))
         if not self.snap.get() or alt: return value
         points=[0,round(self.position*core.FPS),round(self.duration*core.FPS)]
-        for clip in self.project["images"]+self.project["texts"]:
+        for clip in core.visual_clips(self.project)+self.project["texts"]:
             if clip["id"] != ident: points.extend((clip["start"],clip["end"]))
         for clip in self.project["audio_clips"]:
             if clip["id"] != ident:
@@ -977,7 +1258,7 @@ class EditorApp(BaseEditor):
         chosen=None
         for ident in reversed(hits):
             tags=c.gettags(ident)
-            if tags and tags[0] in ("image","audio","text","transition") and len(tags)>1:
+            if tags and tags[0] in ("image","video","audio","text","transition") and len(tags)>1:
                 chosen=(tags[0],tags[1]); break
         if chosen and self._editable():
             kind, ident=chosen
@@ -1052,6 +1333,21 @@ class EditorApp(BaseEditor):
                 trial["source_out"]=min(asset["samples"],max(origin["source_in"]+1,
                                          origin["source_in"]+target_sample-origin["start_sample"]))
             drag["valid"]=self._track_at(c.canvasy(event.y))=="audio" and core.valid_audio(self.project,trial,origin["id"])
+        elif drag["kind"] == "video":
+            if edge == "body":
+                trial["start"] = max(0, self._snap_move_start(origin["start"]+delta, origin["end"]-origin["start"],
+                                                             "video", origin["id"], alt))
+            elif edge == "left":
+                target = self._snap_frame(origin["start"]+delta, "video", origin["id"], alt)
+                trial["start"] = max(0, origin["start"]-origin["source_in_frame"], min(origin["end"]-1, target))
+                trial["source_in_frame"] = origin["source_in_frame"]+trial["start"]-origin["start"]
+            elif edge == "right":
+                asset = next(a for a in self.project["video_assets"] if a["id"] == origin["asset"])
+                target = self._snap_frame(origin["end"]+delta, "video", origin["id"], alt)
+                trial["source_out_frame"] = min(asset["frames"], max(origin["source_in_frame"]+1,
+                                                    origin["source_in_frame"]+target-origin["start"]))
+            trial["end"] = core.video_end(trial)
+            drag["valid"] = self._track_at(c.canvasy(event.y)) == "image" and core.valid_video(self.project, trial)
         else:
             if edge == "body":
                 start=self._snap_move_start(origin["start"]+delta,origin["end"]-origin["start"],
@@ -1097,18 +1393,27 @@ class EditorApp(BaseEditor):
         scale=min(w/1920,h/1080)
         width,height=max(1,int(1920*scale)),max(1,int(1080*scale))
         x,y=(w-width)//2,(h-height)//2
-        frame=max(0,round(self.position*core.FPS))
+        frame=max(0,min(core.total_frames(self.duration)-1,round(self.position*core.FPS)))
         try:
-            cue=core.active_image(self.project,frame)
+            cue=next(iter(core.active_visuals(self.project,frame)),None)
             self.preview_context.configure(text="이미지 없음 · 검은 화면" if self.duration and cue is None else "")
             key=(frame if core.dynamic_frame(self.project,frame) else
                  tuple(c["id"] for c in core.active_images(self.project,frame)),
                  tuple(t["id"] for t in self.project["texts"] if t["start"]<=frame<t["end"]),
                  width,height,self.revision)
             if key!=self.scene_cache_key or self.preview_ref is None:
-                picture=core.render_scene(self.project,frame,self._scene_warn)
-                self.preview_ref=ImageTk.PhotoImage(picture.resize((width,height)),master=self.root)
-                self.scene_cache_key=key
+                if any("source_in_frame" in c for c in core.active_visuals(self.project,frame)):
+                    self._request_video_preview(key, frame)
+                    picture = self.video_preview_picture if self.video_preview_key and self.video_preview_key[-1] == self.revision else None
+                    if picture is not None:
+                        self.preview_ref=ImageTk.PhotoImage(picture.resize((width,height)),master=self.root)
+                        self.scene_cache_key = key if key == self.video_preview_key else None
+                    elif self.preview_ref is None:
+                        self.preview_ref=ImageTk.PhotoImage(Image.new("RGB",(width,height)),master=self.root)
+                else:
+                    picture=core.render_scene(self.project,frame,self._scene_warn)
+                    self.preview_ref=ImageTk.PhotoImage(picture.resize((width,height)),master=self.root)
+                    self.scene_cache_key=key
             self.preview.delete("all"); self.preview.create_image(x,y,image=self.preview_ref,anchor="nw")
             self.preview_rect=(x,y,width,height)
             item=self._selected()
@@ -1120,7 +1425,7 @@ class EditorApp(BaseEditor):
                     hy=y+(t+b)*scale/2
                     self.preview.create_rectangle(hx-5,hy-5,hx+5,hy+5,
                                                   fill=UI_COLORS["primary"],outline="#ffffff")
-            if item and self.selection[0]=="image" and item["start"]<=frame<item["end"]:
+            if item and self.selection[0] in ("image","video") and item["start"]<=frame<item["end"]:
                 state=core.transform_at(item,frame)
                 cx,cy=x+state["x"]*scale,y+state["y"]*scale
                 try: bounds=core.image_bounds(self.project,item,frame)
@@ -1159,14 +1464,15 @@ class EditorApp(BaseEditor):
                 if abs(px-(x+r*w/1920))<=10: return "text",selected,"width_right"
         text=self._preview_hit(px,py)
         if text: return "text",text,"move"
-        selected_image = (selected if selected and self.selection[0]=="image"
+        selected_image = (selected if selected and self.selection[0] in ("image","video")
                           and selected["start"]<=frame<selected["end"] else None)
-        cues = core.active_images(self.project,frame)
+        cues = core.active_visuals(self.project,frame)
         if selected_image:
             cues = [selected_image] + [cue for cue in reversed(cues) if cue is not selected_image]
         else:
             cues = list(reversed(cues))
         for cue in cues:
+            kind = "video" if "source_in_frame" in cue else "image"
             try: bounds=core.image_bounds(self.project,cue,frame)
             except (OSError,ValueError): bounds=None
             if bounds:
@@ -1176,11 +1482,11 @@ class EditorApp(BaseEditor):
                     vl,vt,vr,vb=visible
                     corners=((x+vl*w/1920,y+vt*h/1080),(x+vr*w/1920,y+vt*h/1080),
                              (x+vl*w/1920,y+vb*h/1080),(x+vr*w/1920,y+vb*h/1080))
-                    if self.selection==("image",cue["id"]) and any(
+                    if self.selection==(kind,cue["id"]) and any(
                             abs(px-hx)<=10 and abs(py-hy)<=10 for hx,hy in corners):
-                        return "image",cue,"zoom"
+                        return kind,cue,"zoom"
                 if l <= (px-x)*1920/w <= r and t <= (py-y)*1080/h <= b:
-                    return "image",cue,"move"
+                    return kind,cue,"move"
         return None
 
     def _preview_hover(self,event):
@@ -1200,7 +1506,7 @@ class EditorApp(BaseEditor):
             return
         kind,item,mode=target
         self.selection=(kind,item["id"])
-        original=copy.deepcopy(item[self.motion_key.get()] if kind=="image" else
+        original=copy.deepcopy(item["from" if kind=="video" else self.motion_key.get()] if kind in ("image","video") else
                                {key:item[key] for key in ("x","y","width")})
         self.preview_drag={"kind":kind,"id":item["id"],"mode":mode,"x":event.x,"y":event.y,
                            "original":original,"recorded":False}
@@ -1215,7 +1521,7 @@ class EditorApp(BaseEditor):
         if not drag["recorded"] and max(abs(dx),abs(dy))<4: return
         _,_,w,h=self.preview_rect
         origin=drag["original"]
-        if drag["kind"]=="image":
+        if drag["kind"] in ("image","video"):
             trial=dict(origin)
             if drag["mode"]=="zoom":
                 cx=self.preview_rect[0]+origin["x"]*w/1920
@@ -1226,7 +1532,7 @@ class EditorApp(BaseEditor):
             else:
                 trial["x"]=origin["x"]+dx*1920/w
                 trial["y"]=origin["y"]+dy*1080/h
-            if trial==item[self.motion_key.get()]: return
+            if trial==item["from" if drag["kind"]=="video" else self.motion_key.get()]: return
         else:
             trial=dict(origin)
             if drag["mode"].startswith("width"):
@@ -1243,8 +1549,10 @@ class EditorApp(BaseEditor):
             if all(item[key]==value for key,value in trial.items()): return
         if not drag["recorded"]:
             self._change(); drag["recorded"]=True
-        if drag["kind"]=="image":
-            item[self.motion_key.get()].update(trial)
+        elif drag["kind"]=="video": self.revision += 1
+        if drag["kind"] in ("image","video"):
+            item["from" if drag["kind"]=="video" else self.motion_key.get()].update(trial)
+            if drag["kind"]=="video": item["to"] = dict(item["from"])
             item.pop("legacy_native",None)
         else: item.update(trial)
         self.scene_cache_key=None; self.render_preview()
@@ -1265,22 +1573,30 @@ class EditorApp(BaseEditor):
         self.draw_timeline(); self.render_preview()
 
     def _start_audio(self):
-        if not self.project["audio_clips"] or any(c["asset"] not in self.audio_cache for c in self.project["audio_clips"]):
+        clips = core.timeline_audio(self.project)
+        paths = {key:value["pcm"] for key,value in self.audio_cache.items()}
+        paths.update({"video:"+key:value["pcm"] for key,value in self.video_cache.items() if value.get("pcm")})
+        if not self.duration: return
+        if any(c["asset"] not in paths for c in clips) or any(c["asset"] not in self.video_cache for c in self.project["videos"]):
             self.status.set("음원 분석이 끝나면 재생할 수 있습니다."); return
         self.play_stop=threading.Event(); cancel=self.play_stop
         self.playing=True; self._set_play_button(True)
         start_sample=min(core.duration_samples(self.project),round(self.position*core.RATE))
         self.play_epoch=start_sample/core.RATE
-        clips=copy.deepcopy(self.project["audio_clips"])
-        paths={key:value["pcm"] for key,value in self.audio_cache.items()}
+        clips=copy.deepcopy(clips)
         final=core.duration_samples(self.project)
+        if start_sample >= final: self.position=0; self.play_epoch=0; start_sample=0
+        self.silent_playback = not clips
+        self.play_frames=0
+        if self.silent_playback:
+            self.play_clock=time.monotonic(); return
         def worker():
             try:
                 import sounddevice as sd
                 from contextlib import ExitStack
                 self.play_frames=0
                 with ExitStack() as stack:
-                    streams={ident:stack.enter_context(Path(path).open("rb")) for ident,path in paths.items()}
+                    streams={ident:stack.enter_context(Path(paths[ident]).open("rb")) for ident in {c["asset"] for c in clips}}
                     stream=stack.enter_context(sd.RawOutputStream(samplerate=core.RATE,channels=2,
                                                                    dtype="float32",blocksize=2048))
                     self.play_latency=stream.latency
@@ -1295,16 +1611,27 @@ class EditorApp(BaseEditor):
                 if not cancel.is_set(): self.events.put(("play_error","오디오 재생 실패: 장치를 확인하세요.\n"+str(e)))
         self.play_thread=threading.Thread(target=worker,daemon=True); self.play_thread.start()
 
+    def _tick(self):
+        if self.playing:
+            elapsed = (time.monotonic()-self.play_clock if self.silent_playback else
+                       max(0,self.play_frames/core.RATE-self.play_latency))
+            self.position=min(self.duration,self.play_epoch+elapsed)
+            self.time_label.set(clock(self.position)+" / "+clock(self.duration))
+            self._move_playhead_only(); self.render_preview()
+            if self.silent_playback and self.position >= self.duration: self._stop_audio()
+        self.root.after(33,self._tick)
+
     def start_export(self):
         self._commit_text_draft()
+        if self.video_pending:
+            messagebox.showwarning("내보내기", "영상 준비가 끝날 때까지 기다리세요."); return
         if any(c["asset"] not in self.audio_cache for c in self.project["audio_clips"]):
             messagebox.showwarning("내보내기", "음원 분석이 끝날 때까지 기다리세요."); return
-        if not self.project["audio_clips"]:
-            messagebox.showwarning("내보내기", "타임라인에 음원을 배치하세요."); return
-        # The v1 dialog only reads the legacy audio field in its initial guard.
-        self.project["audio"] = self.project["audio_assets"][0]["path"]
-        try: return super().start_export()
-        finally: self.project.pop("audio", None)
+        if any(c["asset"] not in self.video_cache for c in self.project["videos"]):
+            messagebox.showwarning("내보내기", "영상 준비가 끝날 때까지 기다리세요."); return
+        if not self.duration:
+            messagebox.showwarning("내보내기", "타임라인에 음악 또는 영상을 배치하세요."); return
+        return super().start_export()
 
     def _begin_export(self,path):
         self._commit_text_draft()
@@ -1325,6 +1652,7 @@ class EditorApp(BaseEditor):
             self.export_cancel_button.configure(text="작업 취소")
         snapshot=copy.deepcopy(self.project); duration=self.duration; cancel=self.export_cancel
         paths={key:value["pcm"] for key,value in self.audio_cache.items()}
+        paths.update({"video:"+key:value["pcm"] for key,value in self.video_cache.items() if value.get("pcm")})
         def worker():
             try:
                 result=core.export_video(snapshot,duration,path,ffmpeg,cancel,
@@ -1337,7 +1665,37 @@ class EditorApp(BaseEditor):
         try:
             while True:
                 event=self.events.get_nowait(); kind=event[0]
-                if kind=="audio_ready_v2":
+                if kind=="video_preview":
+                    _,key,picture=event
+                    if key[-1] != self.revision: continue
+                    self.video_preview_key=key; self.video_preview_picture=picture
+                    self.scene_cache_key=None; self.render_preview()
+                elif kind=="video_preview_error":
+                    if event[1] == self.preview_requested:
+                        self.status.set(event[2].splitlines()[0]); self._stop_audio()
+                elif kind=="video_ready":
+                    _,ident,token,prepared=event
+                    if self.video_generation_by_id.get(ident)!=token: continue
+                    self._video_job_finished(ident)
+                    asset=next((a for a in self.project["video_assets"] if a["id"]==ident),None)
+                    if not asset: continue
+                    self.video_cache[ident]=prepared
+                    self._video_metadata(asset, prepared)
+                    invalid = False
+                    for clip in self.project["videos"]:
+                        if clip["asset"] == ident and not core.valid_video(self.project,clip):
+                            invalid = True
+                    self.revision+=1
+                    self.status.set("다시 연결한 영상이 사용 구간보다 짧습니다. 원본 구간을 수정하세요." if invalid else
+                                    "영상 준비 완료. 타임라인에 배치하세요.")
+                    self._refresh()
+                elif kind=="video_error":
+                    _,ident,token,error=event
+                    if self.video_generation_by_id.get(ident)!=token: continue
+                    self._video_job_finished(ident)
+                    self.status.set(error.splitlines()[0])
+                    if not self.video_cancel.is_set(): messagebox.showerror("영상 오류",error)
+                elif kind=="audio_ready_v2":
                     _,ident,token,pcm,bins,samples=event
                     if self.audio_generation_by_id.get(ident)!=token: continue
                     asset=next((a for a in self.project["audio_assets"] if a["id"]==ident),None)
@@ -1383,7 +1741,7 @@ class EditorApp(BaseEditor):
                         self.export_cancel_button.configure(text="닫기")
                     elif "취소" not in event[1]: messagebox.showerror("변환 오류",event[1])
         except queue.Empty: pass
-        self.root.after(80,self._poll)
+        self.root.after(33,self._poll)
 
     def close(self):
         self._commit_text_draft()
@@ -1391,6 +1749,7 @@ class EditorApp(BaseEditor):
             self.export_cancel.set(); self.root.after(100,self.close); return
         if not self._confirm_dirty(): return
         self._save_ui_settings(); self._stop_audio(); self.audio_cancel.set()
+        self._dispose_videos()
         if self.audio_thread: self.audio_thread.join(timeout=3)
         if self.play_thread: self.play_thread.join(timeout=2)
         self._dispose_pcm(); self.root.destroy()

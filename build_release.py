@@ -42,7 +42,7 @@ def main():
     for item in ("bin/ffmpeg.exe", "bin/ffprobe.exe", "LICENSE", "README.txt"):
         shutil.copy2(SOURCE_FFMPEG / item, dest_ff / item)
     for name in ("NOTICE-FFmpeg.txt", "seonyuldam.py", "music_to_video.py", "editor_core.py",
-                 "editor_ui.py", "editor_ui_v2.py", "requirements.txt", "README.md",
+                 "editor_ui.py", "editor_ui_v2.py", "video_media.py", "requirements.txt", "README.md",
                  "VALIDATION.md", "LICENSE-PortAudio.txt", "LICENSE-sounddevice.txt"):
         shutil.copy2(ROOT / name, candidate / name)
     with tempfile.TemporaryDirectory(prefix="music_video_smoke_") as tmp:
