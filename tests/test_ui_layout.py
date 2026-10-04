@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import time
 import tkinter as tk
+from tkinter import ttk
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -13,6 +14,7 @@ from PIL import Image
 
 import editor_core as core
 from editor_ui_v2 import EditorApp
+from editor_ui import UI_COLORS
 
 
 class InitialLayoutTests(unittest.TestCase):
@@ -55,6 +57,9 @@ class InitialLayoutTests(unittest.TestCase):
         self.assertAlmostEqual(app.workspace.sashpos(0), int(height * .64), delta=2)
         self.assertGreater(app.body.winfo_height(), 160)
         self.assertGreater(app.timeline.winfo_height(), 100)
+        self.assertLessEqual(app.left.winfo_width(), app.body.sashpos(0) + 6)
+        self.assertGreaterEqual(app.right.winfo_x(), app.body.sashpos(1))
+        self.assertLessEqual(app.preview.winfo_rootx() + app.preview.winfo_width(), app.right.winfo_rootx())
 
     def test_first_run_with_delayed_window_mapping(self):
         app = EditorApp(self.root)
@@ -63,12 +68,150 @@ class InitialLayoutTests(unittest.TestCase):
         self.settle()
         self.assert_default_panes(app)
 
+    def test_studio_toolbar_fits_minimum_window_and_project_heading_updates(self):
+        app = EditorApp(self.root)
+        self.root.geometry("1040x680+0+0")
+        self.root.deiconify()
+        self.settle()
+        for widget in app.timeline_bar.winfo_children():
+            self.assertTrue(widget.winfo_ismapped(), widget.cget("text"))
+            self.assertGreaterEqual(widget.winfo_x(), 0)
+            self.assertLessEqual(widget.winfo_x() + widget.winfo_width(), app.timeline_bar.winfo_width())
+        self.assertEqual([app.arrange_menu.entrycget(i, "label") for i in range(3)],
+                         ["이미지 모두 이어 붙이기", "음악 모두 이어 붙이기", "영상 모두 이어 붙이기"])
+        self.assertEqual(app.project_state_label.cget("text"), "저장 전")
+        app.project_file = Path(self.folder.name) / "제주의 저녁.json"
+        app._refresh(False)
+        self.assertEqual(app.project_name_label.cget("text"), "제주의 저녁")
+        self.assertEqual(app.project_state_label.cget("text"), "저장됨")
+        app._change()
+        self.assertEqual(app.project_state_label.cget("text"), "● 수정됨")
+
     def test_first_run_with_slow_startup_before_event_loop(self):
         app = EditorApp(self.root)
         time.sleep(.2)
         self.root.deiconify()
         self.settle()
         self.assert_default_panes(app)
+
+    def test_compact_image_inspector_keeps_transition_visible_and_fields_editable(self):
+        image_path = Path(self.folder.name) / "photo.png"
+        Image.new("RGB", (160, 90), "#3579a5").save(image_path)
+        app = EditorApp(self.root)
+        app.project["assets"] = [{"id": "photo", "path": str(image_path)}]
+        clip = core.image_defaults("photo", 0, 180)
+        app.project["images"] = [clip]
+        app.selection = ("image", clip["id"])
+        self.root.geometry("1420x850+0+0")
+        self.root.deiconify()
+        self.settle()
+        app._refresh()
+        self.root.update_idletasks()
+        transition = next(w for w in app.properties.winfo_children() if isinstance(w, ttk.Combobox))
+        self.assertLessEqual(transition.winfo_y() + transition.winfo_height(), app.property_canvas.winfo_height())
+        self.assertFalse(app.property_groups.get("image_advanced", False))
+        # The two time entries must retain their commit behavior after rearranging.
+        time_row = next(w for w in app.properties.winfo_children()
+                        if isinstance(w, ttk.Frame) and len(w.winfo_children()) == 2
+                        and all(isinstance(c, ttk.Frame) for c in w.winfo_children()))
+        fields = [next(c for c in w.winfo_children() if isinstance(c, ttk.Entry))
+                  for w in time_row.winfo_children()]
+        self.assertEqual(fields[0].winfo_rooty(), fields[1].winfo_rooty())
+        fields[1].delete(0, "end"); fields[1].insert(0, "7")
+        fields[1].event_generate("<FocusOut>")
+        self.root.update_idletasks()
+        self.assertEqual(app.project["images"][0]["end"], 210)
+        app._toggle_property_group("image_advanced")
+        self.assertTrue(app.property_groups["image_advanced"])
+        app._commit("image_zoom", "125")
+        self.assertEqual(app.project["images"][0]["from"]["zoom"], 125)
+        app.undo_action()
+        self.assertEqual(app.project["images"][0]["from"]["zoom"], 100)
+
+    def test_media_type_filters_preserve_assets_and_import_commands(self):
+        app = EditorApp(self.root)
+        app.project["assets"] = [{"id": "photo", "path": "photo.png"}]
+        app.project["video_assets"] = [{"id": "video", "path": "video.mp4", "frames": 30}]
+        app._refresh_library()
+        self.assertEqual(set(app.library_markers), {"photo", "video"})
+        app.library_filter.set("사진")
+        self.assertEqual(set(app.library_markers), {"photo"})
+        app.library_filter.set("영상")
+        self.assertEqual(set(app.library_markers), {"video"})
+        app.library_filter.set("전체")
+        self.assertEqual(set(app.library_markers), {"photo", "video"})
+        self.assertEqual(len(app.project["assets"]), 1)
+        self.assertEqual(len(app.project["video_assets"]), 1)
+        self.assertEqual([app.import_menu.entrycget(i, "label") for i in range(3)],
+                         ["음악 가져오기", "이미지 가져오기", "영상 가져오기"])
+
+    def test_property_scrollbar_stays_visible_and_hint_tracks_hidden_content(self):
+        app = EditorApp(self.root)
+        self.root.geometry("1040x680+0+0")
+        self.root.deiconify()
+        self.settle()
+        self.assertEqual(app.property_scroll_hint.cget("text"), "")
+        extra = [ttk.Label(app.properties, text=f"추가 설정 {i}", padding=8) for i in range(30)]
+        for row in extra:
+            row.pack(fill="x")
+        self.root.update_idletasks()
+        bar, canvas = app.property_scrollbar, app.property_canvas
+        self.assertTrue(bar.winfo_ismapped())
+        self.assertGreaterEqual(bar.winfo_width(), 16)
+        self.assertGreaterEqual(bar.winfo_x(), canvas.winfo_x() + canvas.winfo_width())
+        self.assertLessEqual(bar.winfo_x() + bar.winfo_width(), bar.master.winfo_width())
+        self.assertEqual(app.property_scroll_hint.cget("text"), "아래로 스크롤 ↓")
+        canvas.yview_moveto(.4)
+        self.root.update_idletasks()
+        self.assertEqual(app.property_scroll_hint.cget("text"), "↑ 위·아래로 스크롤 ↓")
+        # Exercise the same command used by the scrollbar arrows and track.
+        self.root.tk.call(bar.cget("command"), "moveto", 1)
+        self.root.update_idletasks()
+        self.assertEqual(app.property_scroll_hint.cget("text"), "↑ 위로 스크롤")
+        # Selecting no clip replaces the long inspector with the short empty state.
+        app.selection = None
+        app._show_properties()
+        self.root.update_idletasks()
+        self.assertEqual(app.property_scroll_hint.cget("text"), "")
+        self.assertEqual(canvas.yview(), (0.0, 1.0))
+
+    def test_video_progress_updates_each_file_and_ignores_old_jobs(self):
+        app = EditorApp(self.root)
+        app.project["video_assets"] = [{"id": "v1", "path": "first.mp4"}, {"id": "v2", "path": "second.mp4"}]
+        app.video_pending = {"v1": 1, "v2": 2}
+        app.video_generation_by_id = dict(app.video_pending)
+        app.video_progress = {"v1": (0, "영상 정보 확인"), "v2": (0, "영상 정보 확인")}
+        app._refresh_library()
+        first_label = app.library_video_progress["v1"][0]
+        app.events.put(("video_progress", "v1", 1, 37, "미리보기 생성"))
+        app.events.put(("video_progress", "v2", 2, 64, "미리보기 생성"))
+        app.events.put(("video_progress", "v1", 0, 99, "마무리"))
+        app._poll()
+        self.assertIs(first_label, app.library_video_progress["v1"][0])
+        self.assertIn("37%", first_label.cget("text"))
+        self.assertIn("64%", app.library_video_progress["v2"][0].cget("text"))
+        self.assertIn("외 1개 처리 중", app.status.get())
+        self.assertEqual(app.progress.get(), 37)
+        app.events.put(("audio_cancel_v2", "audio", 3, "취소"))
+        app._poll()
+        self.assertIn("37%", app.status.get())
+        self.assertEqual(str(app.progressbar.cget("mode")), "determinate")
+        app.library_filter.set("영상")
+        self.assertIn("37%", app.library_video_progress["v1"][0].cget("text"))
+        app.video_cancel.set()
+        app.events.put(("video_error", "v1", 1, "작업을 취소했습니다."))
+        app._poll()
+        self.assertNotIn("v1", app.video_pending)
+        self.assertIn("취소됨", app.library_video_progress["v1"][0].cget("text"))
+        self.assertEqual(app.progress.get(), 64)
+        self.assertIn("second.mp4", app.status.get())
+        app.events.put(("video_error", "v2", 2, "작업을 취소했습니다."))
+        app._poll()
+        self.assertFalse(app.video_pending)
+        self.assertEqual(str(app.cancel_button.cget("state")), "disabled")
+        app.events.put(("video_progress", "v2", 2, 99, "마무리"))
+        app._poll()
+        self.assertIn("취소됨", app.library_video_progress["v2"][0].cget("text"))
 
     def test_collapsed_saved_layout_recovers(self):
         self.settings({"geometry": "1280x720+0+0", "panes": [0, 6, 0]})
@@ -234,7 +377,7 @@ class InitialLayoutTests(unittest.TestCase):
         self.assertEqual(app.project["audio_clips"], [])
         app.audio_cache = {a["id"]: {"pcm": "", "bins": [], "samples": a["samples"]}
                            for a in app.project["audio_assets"]}
-        app.append_all_audio()
+        app.arrange_menu.invoke(1)
         clips = app.project["audio_clips"]
         self.assertEqual([c["asset"] for c in clips], ["a", "b"])
         self.assertEqual(core.audio_start(clips[1]), core.audio_end(clips[0]))
@@ -250,7 +393,7 @@ class InitialLayoutTests(unittest.TestCase):
             path = Path(self.folder.name) / f"image{index}.png"
             Image.new("RGB", (16, 9), "blue").save(path)
             app.project["assets"].append({"id": str(index), "path": str(path)})
-        app.append_all_images()
+        app.arrange_menu.invoke(0)
         images = app.project["images"]
         self.assertEqual([c["asset"] for c in images], ["0", "1", "2"])
         self.assertEqual(images[0]["start"], 0)
@@ -341,13 +484,13 @@ class InitialLayoutTests(unittest.TestCase):
         self.settle()
         app._refresh()
         ruler_items = app.timeline.find_overlapping(1, 1, 10, 10)
-        self.assertTrue(any(app.timeline.itemcget(item, "fill") == "#F5F6F8"
+        self.assertTrue(any(app.timeline.itemcget(item, "fill") == UI_COLORS["ruler"]
                             for item in ruler_items))
         clip_items = [item for item in app.timeline.find_all()
                       if app.timeline.gettags(item)[:2] == ("image", clip["id"])]
         self.assertTrue(any(app.timeline.type(item) == "image" for item in clip_items))
-        self.assertTrue(any(app.timeline.itemcget(item, "outline") == "#6366F1"
-                            for item in clip_items if app.timeline.type(item) == "rectangle"))
+        self.assertTrue(any(app.timeline.itemcget(item, "outline") == UI_COLORS["primary"]
+                            for item in clip_items if app.timeline.type(item) in ("rectangle", "polygon")))
 
     def test_timeline_drag_commits_once_and_allows_parallel_images(self):
         app = EditorApp(self.root)

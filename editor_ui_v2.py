@@ -17,6 +17,7 @@ from PIL import Image, ImageOps, ImageTk
 import editor_core as core
 import video_media
 from editor_ui import EditorApp as BaseEditor, UI_COLORS, clock
+from studio_theme import rounded_clip
 
 
 class EditorApp(BaseEditor):
@@ -26,6 +27,7 @@ class EditorApp(BaseEditor):
         self.video_cancel = threading.Event()
         self.video_generation_by_id = {}
         self.video_pending = {}
+        self.video_progress = {}
         self.video_threads = []
         self.preview_cancel = threading.Event()
         self.preview_requests = queue.Queue(maxsize=1)
@@ -48,15 +50,21 @@ class EditorApp(BaseEditor):
         self.pcm = None
         self.bins = []
         self.audio_list = ttk.Frame(self.left, style="Panel.TFrame")
-        self.audio_list.pack(fill="x", after=self.audio_info, padx=8, pady=(0, 5))
+        self.audio_list.pack(fill="x", after=self.audio_info, padx=14, pady=(0, 5))
         self.audio_rows = {}
-        self.text_source = ttk.Label(self.timeline.master.master.master.winfo_children()[0],
-                                     text="텍스트 끌어놓기 ↘", style="Source.TLabel", cursor="hand2")
-        self.text_source.pack(side="left", padx=8)
-        toolbar = self.text_source.master
-        ttk.Button(toolbar, text="이미지 모두 이어 붙이기", command=self.append_all_images).pack(side="left", padx=4)
-        ttk.Button(toolbar, text="음악 모두 이어 붙이기", command=self.append_all_audio).pack(side="left", padx=4)
-        ttk.Button(toolbar, text="영상 모두 이어 붙이기", command=self.append_all_videos).pack(side="left", padx=4)
+        self.text_source = ttk.Label(self.timeline_bar, text="문구 드래그 ↘",
+                                     style="Drag.TLabel", cursor="fleur")
+        self.text_source.pack(side="left", padx=6)
+        self.arrange_button = ttk.Menubutton(self.timeline_bar, text="이어 붙이기")
+        self.arrange_button.pack(side="left", padx=4)
+        self.arrange_menu = tk.Menu(self.arrange_button, tearoff=False,
+                                   bg=UI_COLORS["surface"], fg=UI_COLORS["text"],
+                                   activebackground=UI_COLORS["primary_tint"], activeforeground=UI_COLORS["primary"])
+        for label, command in (("이미지 모두 이어 붙이기", self.append_all_images),
+                               ("음악 모두 이어 붙이기", self.append_all_audio),
+                               ("영상 모두 이어 붙이기", self.append_all_videos)):
+            self.arrange_menu.add_command(label=label, command=command)
+        self.arrange_button.configure(menu=self.arrange_menu)
         self.text_source.bind("<ButtonPress-1>", lambda e: self._library_start("text", None, e))
         self.preview.bind("<Alt-MouseWheel>", self._image_wheel)
         self.preview.bind("<Motion>", self._preview_hover)
@@ -99,6 +107,7 @@ class EditorApp(BaseEditor):
         self.audio_info.configure(text=f"음원 {len(self.project['audio_assets'])}개 · 클립 {len(self.project['audio_clips'])}개")
         self.time_label.set(clock(self.position) + " / " + clock(self.duration))
         self.root.title(("● " if self.dirty else "") + "선율담")
+        self._refresh_project_heading()
         if self.composition_dialog and self.composition_dialog.winfo_exists():
             self._refresh_composition()
 
@@ -138,22 +147,34 @@ class EditorApp(BaseEditor):
         box.bind("<FocusOut>", lambda e: self.root.after_idle(self._commit_text_draft))
         box.bind("<Control-Return>", lambda e: (self._commit_text_draft(), "break"))
 
-    def _show_properties(self):
+    def _populate_properties(self):
         self._commit_text_draft()
         item = self._selected()
         if not item or self.selection[0] == "text":
-            return super()._show_properties()
+            return super()._populate_properties()
         for child in self.properties.winfo_children(): child.destroy()
         kind = self.selection[0]
         if kind == "video":
             asset = next((a for a in self.project["video_assets"] if a["id"] == item["asset"]), None)
             ttk.Label(self.properties, text=Path(asset["path"]).name if asset else "영상 없음",
                       style="PanelTitle.TLabel", wraplength=250).pack(anchor="w")
-            for label, value, key in (("타임라인 시작 (초)", item["start"]/core.FPS, "start_seconds"),
-                                      ("원본 시작 (초)", item["source_in_frame"]/core.FPS, "source_in_seconds"),
-                                      ("원본 끝 (초)", item["source_out_frame"]/core.FPS, "source_out_seconds")):
-                self._prop_entry(label, f"{value:.3f}", key)
-            ttk.Label(self.properties, text=f"타임라인 끝 {clock(item['end']/core.FPS)}").pack(anchor="w", pady=4)
+            self._property_heading("표시 시간과 원본 구간")
+            self._prop_fields((("시작 · 초", f"{item['start']/core.FPS:.3f}", "start_seconds"),
+                               ("끝 · 초", f"{item['end']/core.FPS:.3f}", "end_seconds")))
+            self._prop_fields((("원본 시작 · 초", f"{item['source_in_frame']/core.FPS:.3f}", "source_in_seconds"),
+                               ("원본 끝 · 초", f"{item['source_out_frame']/core.FPS:.3f}", "source_out_seconds")))
+            cycle = item["source_out_frame"] - item["source_in_frame"]
+            repeats = (item["end"] - item["start"] + item.get("loop_offset_frame", 0) + cycle - 1) // cycle
+            ttk.Label(self.properties, text="루프 횟수 (1회 = 한 번 재생)").pack(anchor="w", pady=(6, 0))
+            repeat_row = ttk.Frame(self.properties); repeat_row.pack(fill="x", pady=3)
+            repeat_entry = ttk.Entry(repeat_row, width=8)
+            repeat_entry.insert(0, str(repeats)); repeat_entry.pack(side="left", fill="x", expand=True)
+            apply_repeats = lambda: self._commit("loop_count", repeat_entry.get(), item["id"])
+            ttk.Button(repeat_row, text="횟수 적용", command=apply_repeats).pack(side="left", padx=(4, 0))
+            repeat_entry.bind("<Return>", lambda e: apply_repeats())
+            ttk.Label(self.properties, text="클립을 늘리면 원본 사용 구간이 반복됩니다. 마지막 반복은 중간에 끝날 수 있습니다.",
+                      style="Muted.TLabel", wraplength=245).pack(anchor="w", pady=4)
+            self._property_heading("화면 배치")
             actions = ttk.Frame(self.properties); actions.pack(fill="x", pady=6)
             ttk.Button(actions, text="뒤로 보내기", command=lambda: self._move_image_layer(-1)).pack(side="left")
             ttk.Button(actions, text="앞으로 가져오기", command=lambda: self._move_image_layer(1)).pack(side="left", padx=4)
@@ -162,6 +183,7 @@ class EditorApp(BaseEditor):
             presets = ttk.Frame(self.properties); presets.pack(fill="x", pady=5)
             for label, preset in (("화면 맞춤", "fit"), ("화면 채움", "fill")):
                 ttk.Button(presets, text=label, command=lambda p=preset: self._image_preset(p)).pack(side="left", padx=2)
+            self._property_heading("원본 소리")
             enabled = tk.BooleanVar(value=item.get("audio_enabled", False))
             ttk.Checkbutton(self.properties, text="원본 소리 켜기", variable=enabled,
                             state="normal" if asset and asset.get("has_audio") else "disabled",
@@ -174,57 +196,34 @@ class EditorApp(BaseEditor):
             asset = next((a for a in self.project["audio_assets"] if a["id"] == item["asset"]), None)
             ttk.Label(self.properties, text=Path(asset["path"]).name if asset else "음원 없음",
                       style="PanelTitle.TLabel", wraplength=250).pack(anchor="w")
+            self._property_heading("표시 시간과 원본 구간")
             self._prop_entry("타임라인 시작 (초)", f"{item['start_sample']/core.RATE:.3f}", "start_seconds")
-            self._prop_entry("원본 시작 (초)", f"{item['source_in']/core.RATE:.3f}", "source_in_seconds")
-            self._prop_entry("원본 끝 (초)", f"{item['source_out']/core.RATE:.3f}", "source_out_seconds")
-            self._prop_entry("페이드 인 (초)", f"{item.get('fade_in_samples', 0)/core.RATE:.3f}", "fade_in_seconds")
-            self._prop_entry("페이드 아웃 (초)", f"{item.get('fade_out_samples', 0)/core.RATE:.3f}", "fade_out_seconds")
+            self._prop_fields((("원본 시작 · 초", f"{item['source_in']/core.RATE:.3f}", "source_in_seconds"),
+                               ("원본 끝 · 초", f"{item['source_out']/core.RATE:.3f}", "source_out_seconds")))
+            self._property_heading("페이드")
+            self._prop_fields((("페이드 인 · 초", f"{item.get('fade_in_samples', 0)/core.RATE:.3f}", "fade_in_seconds"),
+                               ("페이드 아웃 · 초", f"{item.get('fade_out_samples', 0)/core.RATE:.3f}", "fade_out_seconds")))
             ttk.Label(self.properties, text="0초로 설정하면 페이드를 끕니다. 짧은 클립에서는 클립 길이까지만 적용합니다.",
                       style="Muted.TLabel", wraplength=245).pack(anchor="w", pady=6)
             return
         asset = next((a for a in self.project["assets"] if a["id"] == item["asset"]), None)
         ttk.Label(self.properties, text=Path(asset["path"]).name if asset else "이미지 없음",
                   style="PanelTitle.TLabel", wraplength=250).pack(anchor="w")
-        self._prop_entry("시작 (초)", f"{item['start']/core.FPS:.3f}", "start_seconds")
-        self._prop_entry("끝 (초)", f"{item['end']/core.FPS:.3f}", "end_seconds")
-        ttk.Label(self.properties, text="겹치는 이미지의 앞뒤 순서", style="Muted.TLabel").pack(anchor="w", pady=(8, 2))
-        layer_actions = ttk.Frame(self.properties, style="Panel.TFrame")
-        layer_actions.pack(fill="x")
-        ttk.Button(layer_actions, text="뒤로 보내기", command=lambda: self._move_image_layer(-1)).pack(side="left")
-        ttk.Button(layer_actions, text="앞으로 가져오기", command=lambda: self._move_image_layer(1)).pack(side="left", padx=4)
-        ttk.Label(self.properties, text="화면 배치", style="PanelTitle.TLabel").pack(anchor="w", pady=(12, 4))
-        ttk.Label(self.properties, text="미리보기에서 이미지를 끌어 이동하거나 모서리로 크기를 조절하세요.",
-                  style="Muted.TLabel", wraplength=245).pack(anchor="w", pady=(0, 8))
+        ttk.Label(self.properties, text="화면 클립 · 이미지", style="Muted.TLabel").pack(anchor="w", pady=(4, 0))
+        self._property_heading("표시 시간")
+        self._prop_fields((("시작 · 초", f"{item['start']/core.FPS:.3f}", "start_seconds"),
+                           ("끝 · 초", f"{item['end']/core.FPS:.3f}", "end_seconds")))
+        self._property_heading("화면 배치")
+        state = item[self.motion_key.get()]
+        self._prop_entry("배율 %", str(round(state["zoom"])), "image_zoom")
         presets = ttk.Frame(self.properties, style="Panel.TFrame")
         presets.pack(fill="x")
-        for index, (label, preset) in enumerate((("화면 맞춤", "fit"), ("화면 채움", "fill"),
-                                                  ("가운데 정렬", "center"), ("초기화", "reset"))):
+        for index, (label, preset) in enumerate((("화면 맞춤", "fit"), ("화면 채움", "fill"))):
             ttk.Button(presets, text=label, command=lambda name=preset: self._image_preset(name)).grid(
                 row=index//2, column=index%2, sticky="ew", padx=(0, 4) if index%2 == 0 else (4, 0), pady=4)
         presets.columnconfigure(0, weight=1)
         presets.columnconfigure(1, weight=1)
-        motion = tk.BooleanVar(value=item.get("motion", False))
-        ttk.Checkbutton(self.properties, text="시작→끝 움직임", variable=motion,
-                        command=lambda: self._commit("motion", motion.get(), item["id"])).pack(anchor="w", pady=5)
-        ttk.Label(self.properties, text="편집할 상태").pack(anchor="w")
-        state_labels = {"from": "시작 상태", "to": "끝 상태"}
-        selected_state = tk.StringVar(value=state_labels[self.motion_key.get()])
-        state_combo = ttk.Combobox(self.properties, values=tuple(state_labels.values()), textvariable=selected_state,
-                                   state="readonly")
-        state_combo.pack(fill="x")
-        state_combo.bind("<<ComboboxSelected>>", lambda e: (self.motion_key.set(
-            next(key for key, label in state_labels.items() if label == selected_state.get())), self._show_properties()))
-        state = item[self.motion_key.get()]
-        for label, key in (("가로 중심", "image_x"), ("세로 중심", "image_y"), ("배율 %", "image_zoom")):
-            self._prop_entry(label, str(round(state[key[6:]])), key)
-        ttk.Label(self.properties, text="움직임 속도").pack(anchor="w", pady=(6, 0))
-        easing_labels = {"smooth": "부드럽게", "linear": "일정하게"}
-        ease = tk.StringVar(value=easing_labels[item.get("easing", "smooth")])
-        combo = ttk.Combobox(self.properties, values=tuple(easing_labels.values()), textvariable=ease, state="readonly")
-        combo.pack(fill="x")
-        combo.bind("<<ComboboxSelected>>", lambda e: self._commit("easing",
-                   next(key for key, label in easing_labels.items() if label == ease.get()), item["id"]))
-        ttk.Label(self.properties, text="이미지 전환").pack(anchor="w", pady=(6, 0))
+        self._property_heading("이미지 전환")
         effects = {"cut":"즉시 전환", "dissolve":"크로스 디졸브", "fade_black":"검정 페이드", "slide":"좌우 슬라이드"}
         current = tk.StringVar(value=effects.get(item.get("transition", {}).get("type", "cut"), "즉시 전환"))
         combo = ttk.Combobox(self.properties, values=list(effects.values()), textvariable=current, state="readonly")
@@ -236,6 +235,34 @@ class EditorApp(BaseEditor):
         if item["transition"]["type"] != "cut" and effect == "cut":
             ttk.Label(self.properties, text="앞 이미지와 맞닿을 때 전환이 적용됩니다.",
                       style="Muted.TLabel", wraplength=245).pack(anchor="w")
+        self._property_group("image_advanced", "움직임과 레이어", lambda box: self._build_image_advanced(box, item))
+
+    def _build_image_advanced(self, box, item):
+        state = item[self.motion_key.get()]
+        self._prop_fields((("가로 중심", str(round(state["x"])), "image_x"),
+                           ("세로 중심", str(round(state["y"])), "image_y")), box)
+        layer_actions = ttk.Frame(box); layer_actions.pack(fill="x", pady=(0, 8))
+        ttk.Button(layer_actions, text="뒤로", command=lambda: self._move_image_layer(-1)).pack(side="left")
+        ttk.Button(layer_actions, text="앞으로", command=lambda: self._move_image_layer(1)).pack(side="left", padx=4)
+        ttk.Button(box, text="가운데 정렬", command=lambda: self._image_preset("center")).pack(fill="x", pady=3)
+        ttk.Button(box, text="배치 초기화", command=lambda: self._image_preset("reset")).pack(fill="x", pady=3)
+        motion = tk.BooleanVar(value=item.get("motion", False))
+        ttk.Checkbutton(box, text="시작→끝 움직임", variable=motion,
+                        command=lambda: self._commit("motion", motion.get(), item["id"])).pack(anchor="w", pady=8)
+        ttk.Label(box, text="편집할 상태", style="Muted.TLabel").pack(anchor="w", pady=(0, 4))
+        state_labels = {"from": "시작 상태", "to": "끝 상태"}
+        selected_state = tk.StringVar(value=state_labels[self.motion_key.get()])
+        combo = ttk.Combobox(box, values=tuple(state_labels.values()), textvariable=selected_state, state="readonly")
+        combo.pack(fill="x")
+        combo.bind("<<ComboboxSelected>>", lambda e: (self.motion_key.set(
+            next(key for key, label in state_labels.items() if label == selected_state.get())), self._show_properties()))
+        ttk.Label(box, text="움직임 속도", style="Muted.TLabel").pack(anchor="w", pady=(8, 4))
+        easing_labels = {"smooth": "부드럽게", "linear": "일정하게"}
+        ease = tk.StringVar(value=easing_labels[item.get("easing", "smooth")])
+        combo = ttk.Combobox(box, values=tuple(easing_labels.values()), textvariable=ease, state="readonly")
+        combo.pack(fill="x")
+        combo.bind("<<ComboboxSelected>>", lambda e: self._commit("easing",
+                   next(key for key, label in easing_labels.items() if label == ease.get()), item["id"]))
 
     def _toggle_property_group(self, key):
         self._commit_text_draft()
@@ -268,8 +295,23 @@ class EditorApp(BaseEditor):
                     value = float(raw)
                     if not math.isfinite(value): raise ValueError("유한한 숫자를 입력하세요.")
                     if key == "start_seconds": trial["start"] = max(0, round(value*core.FPS))
+                    elif key == "end_seconds":
+                        if round(value*core.FPS) == item["end"]: return
+                        trial["duration_frames"] = round(value*core.FPS) - trial["start"]
                     elif key in ("source_in_seconds", "source_out_seconds"):
-                        trial[key.replace("seconds", "frame")] = round(value*core.FPS)
+                        cycle = item["source_out_frame"] - item["source_in_frame"]
+                        field = key.replace("seconds", "frame")
+                        if round(value*core.FPS) == item[field]: return
+                        trial[field] = round(value*core.FPS)
+                        if "duration_frames" in item:
+                            new_cycle = trial["source_out_frame"] - trial["source_in_frame"]
+                            trial["duration_frames"] = max(1, round(item["duration_frames"]*new_cycle/cycle))
+                            trial["loop_offset_frame"] = 0
+                    elif key == "loop_count":
+                        if not value.is_integer() or value < 1:
+                            raise ValueError("루프 횟수는 1 이상의 정수입니다.")
+                        trial["duration_frames"] = (trial["source_out_frame"]-trial["source_in_frame"]) * int(value)
+                        trial["loop_offset_frame"] = 0
                     elif key == "video_gain":
                         if not 0 <= value <= 200: raise ValueError("음량은 0~200%입니다.")
                         trial["audio_gain"] = value/100
@@ -281,7 +323,7 @@ class EditorApp(BaseEditor):
                         trial["to"] = dict(trial["from"])
                     else: return
                 trial["end"] = core.video_end(trial)
-                if not core.valid_video(self.project, trial): raise ValueError("원본 사용 구간이 잘못되었습니다.")
+                if not core.valid_video(self.project, trial): raise ValueError("원본 사용 구간과 타임라인 길이를 확인하세요.")
             elif kind == "audio":
                 asset = next(a for a in self.project["audio_assets"] if a["id"] == item["asset"])
                 value = round(float(raw) * core.RATE)
@@ -396,15 +438,14 @@ class EditorApp(BaseEditor):
         token = self.audio_token
         self.video_generation_by_id[asset["id"]] = token
         self.video_pending[asset["id"]] = token
+        self.video_progress[asset["id"]] = (0, "영상 정보 확인")
         cancel = self.video_cancel
         ident, path = asset["id"], asset["path"]
-        self.cancel_button.configure(state="normal")
-        self.progressbar.configure(mode="indeterminate"); self.progressbar.start(12)
-        self._show_job_controls(running=True)
-        self.status.set("영상 미리보기 준비 중… " + Path(path).name)
+        self._update_video_import_display()
         def worker():
             try:
-                prepared = video_media.prepare_video(path, ffmpeg, ffprobe, cancel)
+                prepared = video_media.prepare_video(path, ffmpeg, ffprobe, cancel,
+                    progress=lambda percent, stage: self.events.put(("video_progress", ident, token, percent, stage)))
                 self.events.put(("video_ready", ident, token, prepared))
             except Exception as e:
                 self.events.put(("video_error", ident, token, str(e)))
@@ -425,11 +466,26 @@ class EditorApp(BaseEditor):
 
     def _video_job_finished(self, ident):
         self.video_pending.pop(ident, None)
+        self.video_progress.pop(ident, None)
         if self.video_pending:
-            self.progressbar.configure(mode="indeterminate"); self.progressbar.start(12)
-            self.cancel_button.configure(state="normal"); self._show_job_controls(running=True)
+            self._update_video_import_display()
         else:
             self.progressbar.stop(); self.cancel_button.configure(state="disabled"); self._show_job_controls()
+
+    def _update_video_import_display(self):
+        for ident, (label, name) in getattr(self, "library_video_progress", {}).items():
+            label.configure(text=f"▷ {name}\n{self._video_import_caption(ident)}")
+        if not self.video_pending: return
+        ident = next(iter(self.video_pending))
+        percent, stage = self.video_progress[ident]
+        asset = next((a for a in self.project["video_assets"] if a["id"] == ident), None)
+        if asset is None: return
+        self.progressbar.stop(); self.progressbar.configure(mode="determinate")
+        self.progress.set(percent)
+        self.cancel_button.configure(state="normal")
+        self._show_job_controls(running=True)
+        others = f" · 외 {len(self.video_pending) - 1}개 처리 중" if len(self.video_pending) > 1 else ""
+        self.status.set(f"영상 가져오기 {percent}% · {stage} · {Path(asset['path']).name}{others}")
 
     def place_video(self, asset_id, frame):
         if not self._editable(): return
@@ -461,6 +517,7 @@ class EditorApp(BaseEditor):
         self.video_cancel.set(); self.preview_cancel.set()
         self.video_generation_by_id.clear()
         self.video_pending.clear()
+        self.video_progress.clear()
         if self.preview_thread: self.preview_thread.join(timeout=3)
         for thread in self.video_threads: thread.join(timeout=3)
         self.video_threads.clear(); self.video_cache.clear()
@@ -536,6 +593,7 @@ class EditorApp(BaseEditor):
         self.progressbar.configure(mode="indeterminate"); self.progressbar.start(12)
         self._show_job_controls(running=True)
         self.status.set("음원을 분석하는 중… " + Path(asset["path"]).name)
+        if self.video_pending: self._update_video_import_display()
         def worker():
             try:
                 core.probe_audio(asset["path"], self.tool("ffprobe"))
@@ -1167,13 +1225,10 @@ class EditorApp(BaseEditor):
         if x1 < c.canvasx(0) or x0 > c.canvasx(c.winfo_width()): return
         visible_left=max(x0,c.canvasx(0))
         selected = self.selection == (kind,item["id"])
-        c.create_rectangle(x0,y,x1,y+h,fill=color,
+        rounded_clip(c,x0,y,x1,y+h,fill=color,
                            outline=UI_COLORS["primary"] if selected else UI_COLORS["clip_border"],
-                           width=3 if selected else 1,
+                           width=2 if selected else 1,
                            tags=(kind,item["id"]))
-        if x1-x0 > 8:
-            c.create_rectangle(x0+3,y+3,x1-3,y+6,
-                               fill=UI_COLORS[f"{kind}_clip_top"],outline="",tags=(kind,item["id"]))
         label_x=visible_left+10
         if thumbnail and x1-visible_left > 110:
             try:
@@ -1201,7 +1256,7 @@ class EditorApp(BaseEditor):
             c.create_text(label_x,y+10 if kind=="audio" else y+h/2,
                           text=label[:chars-1]+"…" if len(label)>chars else label,
                           anchor="nw" if kind=="audio" else "w",fill=UI_COLORS["timeline_text"],
-                          font=("Malgun Gothic",9,"bold"),tags=(kind,item["id"]))
+                          font=("Malgun Gothic",9),tags=(kind,item["id"]))
 
     def _snap_frame(self, value, kind, ident, alt=False):
         value=max(0,int(value))
@@ -1334,18 +1389,25 @@ class EditorApp(BaseEditor):
                                          origin["source_in"]+target_sample-origin["start_sample"]))
             drag["valid"]=self._track_at(c.canvasy(event.y))=="audio" and core.valid_audio(self.project,trial,origin["id"])
         elif drag["kind"] == "video":
+            cycle = origin["source_out_frame"] - origin["source_in_frame"]
             if edge == "body":
                 trial["start"] = max(0, self._snap_move_start(origin["start"]+delta, origin["end"]-origin["start"],
                                                              "video", origin["id"], alt))
             elif edge == "left":
                 target = self._snap_frame(origin["start"]+delta, "video", origin["id"], alt)
-                trial["start"] = max(0, origin["start"]-origin["source_in_frame"], min(origin["end"]-1, target))
-                trial["source_in_frame"] = origin["source_in_frame"]+trial["start"]-origin["start"]
+                trial["start"] = max(0, min(origin["end"]-1, target))
+                if "duration_frames" not in origin and trial["start"] >= origin["start"]:
+                    trial["source_in_frame"] = origin["source_in_frame"]+trial["start"]-origin["start"]
+                else:
+                    trial["duration_frames"] = origin["end"]-trial["start"]
+                    trial["loop_offset_frame"] = (origin.get("loop_offset_frame", 0)+trial["start"]-origin["start"]) % cycle
             elif edge == "right":
-                asset = next(a for a in self.project["video_assets"] if a["id"] == origin["asset"])
                 target = self._snap_frame(origin["end"]+delta, "video", origin["id"], alt)
-                trial["source_out_frame"] = min(asset["frames"], max(origin["source_in_frame"]+1,
-                                                    origin["source_in_frame"]+target-origin["start"]))
+                length = max(1, target-origin["start"])
+                if "duration_frames" not in origin and length <= cycle:
+                    trial["source_out_frame"] = origin["source_in_frame"]+length
+                else:
+                    trial["duration_frames"] = length
             trial["end"] = core.video_end(trial)
             drag["valid"] = self._track_at(c.canvasy(event.y)) == "image" and core.valid_video(self.project, trial)
         else:
@@ -1686,14 +1748,24 @@ class EditorApp(BaseEditor):
                         if clip["asset"] == ident and not core.valid_video(self.project,clip):
                             invalid = True
                     self.revision+=1
-                    self.status.set("다시 연결한 영상이 사용 구간보다 짧습니다. 원본 구간을 수정하세요." if invalid else
-                                    "영상 준비 완료. 타임라인에 배치하세요.")
+                    if invalid:
+                        self.status.set("다시 연결한 영상이 사용 구간보다 짧습니다. 원본 구간을 수정하세요.")
+                    elif not self.video_pending:
+                        self.progress.set(100)
+                        self.status.set("영상 가져오기 100% 완료. 타임라인에 배치하세요.")
                     self._refresh()
+                elif kind=="video_progress":
+                    _,ident,token,percent,stage=event
+                    if self.video_pending.get(ident)!=token: continue
+                    self.video_progress[ident]=(percent,stage)
+                    self._update_video_import_display()
                 elif kind=="video_error":
                     _,ident,token,error=event
                     if self.video_generation_by_id.get(ident)!=token: continue
                     self._video_job_finished(ident)
-                    self.status.set(error.splitlines()[0])
+                    self.video_progress[ident]=(None, "가져오기 취소됨" if self.video_cancel.is_set() else "가져오기 실패")
+                    self._update_video_import_display()
+                    if not self.video_pending: self.status.set(error.splitlines()[0])
                     if not self.video_cancel.is_set(): messagebox.showerror("영상 오류",error)
                 elif kind=="audio_ready_v2":
                     _,ident,token,pcm,bins,samples=event
@@ -1710,13 +1782,16 @@ class EditorApp(BaseEditor):
                     self._refresh()
                     if not self.project["audio_clips"] and self.project["audio_assets"][0]["id"]==ident:
                         self.place_audio(ident,0)
+                    if self.video_pending: self._update_video_import_display()
                 elif kind=="audio_error_v2":
                     _,ident,token,error=event
                     if self.audio_generation_by_id.get(ident)==token:
                         self.progressbar.stop(); self._show_job_controls()
                         self.status.set(error.splitlines()[0]); messagebox.showerror("음원 오류",error)
+                        if self.video_pending: self._update_video_import_display()
                 elif kind=="audio_cancel_v2":
                     self.progressbar.stop(); self._show_job_controls(); self.status.set("음원 분석을 취소했습니다.")
+                    if self.video_pending: self._update_video_import_display()
                 elif kind=="play_error":
                     self._stop_audio(); self.status.set(event[1].splitlines()[0]); messagebox.showerror("재생 오류",event[1])
                 elif kind=="play_end":

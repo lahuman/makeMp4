@@ -56,7 +56,7 @@ def audio_defaults(asset, start, samples):
 
 
 def audio_end(clip):
-    return audio_start(clip) + int(clip["source_out"]) - int(clip["source_in"])
+    return audio_start(clip) + clip.get("duration_samples", int(clip["source_out"]) - int(clip["source_in"]))
 
 
 def video_defaults(asset, start, frames):
@@ -67,13 +67,17 @@ def video_defaults(asset, start, frames):
 
 
 def video_end(clip):
-    return clip["start"] + clip["source_out_frame"] - clip["source_in_frame"]
+    return clip["start"] + clip.get("duration_frames", clip["source_out_frame"] - clip["source_in_frame"])
 
 
 def valid_video(project, clip):
     asset = next((a for a in project.get("video_assets", []) if a["id"] == clip["asset"]), None)
     return bool(asset and all(type(clip.get(k)) is int for k in ("start", "end", "source_in_frame", "source_out_frame"))
                 and 0 <= clip["source_in_frame"] < clip["source_out_frame"] <= asset.get("frames", 0)
+                and type(clip.get("duration_frames", 1)) is int and clip.get("duration_frames", 1) > 0
+                and type(clip.get("loop_offset_frame", 0)) is int
+                and ("duration_frames" in clip or clip.get("loop_offset_frame", 0) == 0)
+                and 0 <= clip.get("loop_offset_frame", 0) < clip["source_out_frame"] - clip["source_in_frame"]
                 and clip["start"] >= 0 and clip["end"] == video_end(clip)
                 and math.isfinite(clip.get("audio_gain", 1)) and 0 <= clip.get("audio_gain", 1) <= 2)
 
@@ -95,13 +99,17 @@ def timeline_audio(project):
     for video in project.get("videos", []):
         asset = assets.get(video["asset"])
         if video.get("audio_enabled") and asset and asset.get("has_audio"):
-            clips.append({"id": video["id"], "asset": "video:" + video["asset"],
+            linked = {"id": video["id"], "asset": "video:" + video["asset"],
                           "start_sample": video["start"] * (RATE // FPS),
                           "source_in": video["source_in_frame"] * (RATE // FPS),
                           "source_out": video["source_out_frame"] * (RATE // FPS),
                           "gain": video.get("audio_gain", 1.0),
                           "fade_in_samples": video.get("fade_in_samples", 0),
-                          "fade_out_samples": video.get("fade_out_samples", 0)})
+                          "fade_out_samples": video.get("fade_out_samples", 0)}
+            if "duration_frames" in video:
+                linked.update(duration_samples=video["duration_frames"] * (RATE // FPS),
+                              loop_offset_samples=video.get("loop_offset_frame", 0) * (RATE // FPS))
+            clips.append(linked)
     return clips
 
 
@@ -611,8 +619,23 @@ def mixed_audio_chunk(clips, streams, cursor, count):
     output = array("f", [0.0]) * (count * 2) if overlapping else bytearray(count * 8)
     for begin, end, clip in active:
         source = streams[clip["asset"]]
-        source.seek((clip["source_in"] + begin - audio_start(clip)) * 8)
-        raw = source.read((end - begin) * 8)
+        if "duration_samples" in clip:
+            cycle = clip["source_out"] - clip["source_in"]
+            offset = (clip.get("loop_offset_samples", 0) + begin - audio_start(clip)) % cycle
+            raw = bytearray()
+            remaining = end - begin
+            while remaining:
+                chunk = min(remaining, cycle - offset)
+                source.seek((clip["source_in"] + offset) * 8)
+                part = source.read(chunk * 8)
+                if len(part) != chunk * 8:
+                    raise EditorError("오디오 캐시가 짧습니다. 다시 분석하세요.")
+                raw.extend(part)
+                remaining -= chunk
+                offset = 0
+        else:
+            source.seek((clip["source_in"] + begin - audio_start(clip)) * 8)
+            raw = source.read((end - begin) * 8)
         if len(raw) != (end - begin) * 8:
             raise EditorError("오디오 캐시가 짧습니다. 다시 분석하세요.")
         length = audio_end(clip) - audio_start(clip)
@@ -650,9 +673,11 @@ def mixed_audio_chunk(clips, streams, cursor, count):
     return bytes(output)
 
 
-def _run_encoder(command, cancel, progress=None, input_frames=None):
+def _run_encoder(command, cancel, progress=None, input_frames=None, output_time=None):
     """Read both FFmpeg pipes so a full pipe cannot stall cancellation."""
     if cancel.is_set(): raise EditorError("작업을 취소했습니다.")
+    if output_time is not None:
+        command = [command[0], "-progress", "pipe:1", "-nostats", *command[1:]]
     p = subprocess.Popen(command, stdin=subprocess.PIPE if input_frames is not None else subprocess.DEVNULL,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -664,6 +689,10 @@ def _run_encoder(command, cancel, progress=None, input_frames=None):
             if collect:
                 errors.append(raw.decode("utf-8", "replace"))
                 if len(errors) > 60: del errors[:20]
+            elif output_time is not None and raw.startswith(b"out_time_us="):
+                try: seconds = int(raw.partition(b"=")[2]) / 1_000_000
+                except ValueError: continue
+                output_time(max(0, seconds))
     readers = [threading.Thread(target=drain, args=(p.stdout, False), daemon=True),
                threading.Thread(target=drain, args=(p.stderr, True), daemon=True)]
     for t in readers: t.start()

@@ -64,7 +64,17 @@ def probe_video(path, ffprobe, cancel=None, count=False):
         raise core.EditorError("영상 정보 분석 실패: " + str(e)) from e
 
 
-def prepare_video(path, ffmpeg, ffprobe, cancel, cache_dir=None):
+def prepare_video(path, ffmpeg, ffprobe, cancel, cache_dir=None, progress=None):
+    last_report = (-1, "")
+    def report(percent, stage):
+        nonlocal last_report
+        current = (max(last_report[0], min(100, int(percent))), stage)
+        if current != last_report:
+            last_report = current
+            if progress: progress(*current)
+
+    if cancel.is_set(): raise core.EditorError("영상 분석을 취소했습니다.")
+    report(0, "영상 정보 확인")
     source = Path(path).resolve()
     stat = source.stat()
     key = hashlib.sha256(f"video-v3-1|{source}|{stat.st_size}|{stat.st_mtime_ns}".encode()).hexdigest()
@@ -75,9 +85,14 @@ def prepare_video(path, ffmpeg, ffprobe, cancel, cache_dir=None):
         cached = json.loads(manifest.read_text(encoding="utf-8"))
         if (Path(cached["proxy"]).is_file() and Path(cached["thumbnail"]).is_file()
                 and (not cached["has_audio"] or Path(cached["pcm"]).stat().st_size == cached["frames"]*(core.RATE//core.FPS)*8)):
+            if cancel.is_set(): raise core.EditorError("영상 분석을 취소했습니다.")
+            report(100, "가져오기 완료")
             return cached
     except (OSError, ValueError, KeyError, TypeError): pass
     info = probe_video(source, ffprobe, cancel)
+    # Stage weights describe completed work, not a prediction of remaining time.
+    proxy_end = 80 if info["has_audio"] else 96
+    report(2, "미리보기 생성")
     scale = min(1, 960/info["width"], 540/info["height"])
     pw, ph = max(2, round(info["width"]*scale/2)*2), max(2, round(info["height"]*scale/2)*2)
     token = core.uid()
@@ -89,7 +104,9 @@ def prepare_video(path, ffmpeg, ffprobe, cancel, cache_dir=None):
         core._run_encoder([ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-y", "-i", str(source),
                            "-map", f"0:{info['video_stream']}", "-vf", NORMALIZE + f",scale={pw}:{ph},setsar=1",
                            "-c:v", "libx264", "-preset", "veryfast", "-crf", "25", "-g", "15",
-                           "-pix_fmt", "yuv420p", "-an", str(parts["proxy"])], cancel)
+                           "-pix_fmt", "yuv420p", "-an", str(parts["proxy"])], cancel,
+                          output_time=lambda seconds: report(2 + (proxy_end - 2) * min(1, seconds / info["duration"]), "미리보기 생성"))
+        report(proxy_end, "미리보기 확인")
         proxy_info = probe_video(parts["proxy"], ffprobe, cancel)
         if not proxy_info["frames"]: proxy_info = probe_video(parts["proxy"], ffprobe, cancel, count=True)
         frames = proxy_info["frames"]
@@ -98,6 +115,7 @@ def prepare_video(path, ffmpeg, ffprobe, cancel, cache_dir=None):
                            "-i", str(parts["proxy"]), "-frames:v", "1", str(parts["thumbnail"])], cancel)
         bins = []
         if info["has_audio"]:
+            report(82, "소리 추출")
             delay = info["audio_start"] - info["video_start"]
             samples = frames * (core.RATE // core.FPS)
             audio_filter = (f"asetpts=PTS-STARTPTS+({delay:.9f})/TB,"
@@ -105,14 +123,18 @@ def prepare_video(path, ffmpeg, ffprobe, cancel, cache_dir=None):
             core._run_encoder([ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-y", "-i", str(source),
                                "-map", f"0:{info['audio_stream']}", "-vn", "-af", audio_filter,
                                "-ac", "2", "-ar", str(core.RATE), "-c:a", "pcm_f32le", "-f", "f32le",
-                               str(parts["pcm"])], cancel)
+                               str(parts["pcm"])], cancel,
+                              output_time=lambda seconds: report(82 + 12 * min(1, seconds / (frames / core.FPS)), "소리 추출"))
             if parts["pcm"].stat().st_size != samples*8:
                 raise core.EditorError("영상 오디오 길이가 일치하지 않습니다.")
+            report(94, "파형 분석")
             with parts["pcm"].open("rb") as stream:
                 while raw := stream.read((core.RATE//100)*8):
                     if cancel.is_set(): raise core.EditorError("영상 분석을 취소했습니다.")
                     values = array("f"); values.frombytes(raw)
                     bins.append(max((abs(v) for v in values), default=0))
+                    report(94 + 5 * stream.tell() / (samples * 8), "파형 분석")
+        report(99, "마무리")
         if cancel.is_set(): raise core.EditorError("영상 분석을 취소했습니다.")
         for kind in parts:
             if parts[kind].is_file(): os.replace(parts[kind], final[kind])
@@ -123,6 +145,7 @@ def prepare_video(path, ffmpeg, ffprobe, cancel, cache_dir=None):
         parts["manifest"] = temp_manifest
         temp_manifest.write_text(json.dumps(info), encoding="utf-8")
         os.replace(temp_manifest, manifest)
+        report(100, "가져오기 완료")
         return info
     finally:
         for part in parts.values(): part.unlink(missing_ok=True)
@@ -221,7 +244,8 @@ class VideoFrameProvider:
         if not asset: raise core.EditorError("영상 원본을 찾을 수 없습니다.")
         if clip["id"] not in self.decoders:
             self.decoders[clip["id"]] = VideoDecoder(asset, self.ffmpeg, self.cancel, self.preview)
-        number = clip["source_in_frame"] + frame - clip["start"]
+        number = clip["source_in_frame"] + ((clip.get("loop_offset_frame", 0) + frame - clip["start"])
+                                           % (clip["source_out_frame"] - clip["source_in_frame"]))
         return self.decoders[clip["id"]].get(number)
 
     def __enter__(self): return self
