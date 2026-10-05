@@ -1,4 +1,5 @@
 """Regression checks against real Tk geometry (requires a desktop session)."""
+import copy
 import json
 import os
 from pathlib import Path
@@ -144,6 +145,269 @@ class InitialLayoutTests(unittest.TestCase):
         self.assertEqual(len(app.project["video_assets"]), 1)
         self.assertEqual([app.import_menu.entrycget(i, "label") for i in range(3)],
                          ["음악 가져오기", "이미지 가져오기", "영상 가져오기"])
+
+    def test_music_library_visible_in_small_window_and_scrolls_to_last_song(self):
+        app = EditorApp(self.root)
+        app.project["audio_assets"] = [
+            {"id": f"song{i}", "path": f"음악 {i + 1:02d}.mp3", "samples": 48000}
+            for i in range(2)]
+        app._refresh()
+        self.root.deiconify()
+        for size in ("1420x850+0+0", "1040x680+0+0"):
+            self.root.geometry(size)
+            self.settle()
+            self.assertEqual(set(app.library_markers), {"song0", "song1"})
+            self.assertGreater(app.library_canvas.winfo_height(), 40)
+            for label in app.audio_rows.values():
+                self.assertTrue(label.winfo_ismapped())
+                self.assertGreaterEqual(label.winfo_rooty(), app.library_canvas.winfo_rooty())
+                self.assertLessEqual(label.winfo_rooty() + label.winfo_height(),
+                                     app.library_canvas.winfo_rooty() + app.library_canvas.winfo_height())
+        app.project["audio_assets"].extend(
+            {"id": f"song{i}", "path": f"음악 {i + 1:02d}.mp3", "samples": 48000}
+            for i in range(2, 30))
+        app._refresh()
+        app.library_filter.set("음악")
+        self.root.update_idletasks()
+        self.assertEqual(len(app.audio_rows), 30)
+        self.assertLess(app.library_canvas.yview()[1], 1)
+        self.assertTrue(app.library_scrollbar.winfo_ismapped())
+        canvas = app.library_canvas
+        self.assertEqual(app._panel_wheel(SimpleNamespace(widget=canvas, delta=-120,
+                         x_root=canvas.winfo_rootx()+5, y_root=canvas.winfo_rooty()+5)), "break")
+        self.assertGreater(canvas.yview()[0], 0)
+        self.root.tk.call(app.library_scrollbar.cget("command"), "moveto", 1)
+        self.root.update_idletasks()
+        last = app.audio_rows["song29"]
+        self.assertGreaterEqual(last.winfo_rooty(), app.library_canvas.winfo_rooty())
+        self.assertLessEqual(last.winfo_rooty() + last.winfo_height(),
+                             app.library_canvas.winfo_rooty() + app.library_canvas.winfo_height())
+
+    def test_music_import_preserves_filters_and_selection_adds_audio_clip(self):
+        app = EditorApp(self.root)
+        paths = [Path(self.folder.name) / name for name in ("첫 음악.wav", "둘째 음악.wav")]
+        for path in paths:
+            path.touch()
+        image = Path(self.folder.name) / "photo.png"
+        Image.new("RGB", (160, 90), "#3579a5").save(image)
+        app.project["assets"] = [{"id": "photo", "path": str(image)}]
+        app.project["video_assets"] = [{"id": "video", "path": "video.mp4"}]
+        app.library_filter.set("영상")
+        app.project_search.set("없는 이름")
+        app.library_view.set("목록")
+        with patch("editor_ui_v2.filedialog.askopenfilenames", return_value=[str(p) for p in paths]), \
+                patch.object(app, "_analyze_asset"):
+            app.choose_audio()
+        ids = {a["id"] for a in app.project["audio_assets"]}
+        self.assertEqual(app.library_filter.get(), "영상")
+        self.assertEqual(app.project_search.get(), "없는 이름")
+        self.assertEqual(app.library_view.get(), "목록")
+        self.assertEqual(set(app.library_markers), set())
+        app.project_search.set("")
+        self.assertEqual(set(app.library_markers), {"video"})
+        app.library_filter.set("음악")
+        self.assertEqual(set(app.library_markers), ids)
+        second = app.project["audio_assets"][1]
+        app.audio_cache[second["id"]] = {"bins": []}
+        second["samples"] = 48000
+        app._refresh()
+        self.assertIn("✓", app.audio_rows[second["id"]].cget("text"))
+        app._library_down(second["id"])
+        self.assertEqual(app.library_drag["kind"], "audio")
+        app.add_selected_asset()
+        self.assertEqual(app.project["audio_clips"][0]["asset"], second["id"])
+        app.project_search.set("첫 음악")
+        self.assertEqual(set(app.library_markers), {app.project["audio_assets"][0]["id"]})
+        app.project_search.set("")
+        app.library_filter.set("전체")
+        self.assertEqual(set(app.library_markers), ids | {"photo", "video"})
+        self.assertEqual(len(app.thumb_refs), 1)
+        app.library_view.set("목록")
+        self.assertEqual(set(app.library_markers), ids | {"photo", "video"})
+        app.library_filter.set("사진")
+        self.assertEqual(set(app.library_markers), {"photo"})
+        app.library_filter.set("영상")
+        self.assertEqual(set(app.library_markers), {"video"})
+
+    def test_timeline_clipboard_preserves_trim_loop_settings_and_undo(self):
+        app = EditorApp(self.root)
+        app.project["audio_assets"] = [{"id": "a", "path": "music.wav", "samples": 480000}]
+        app.audio_cache["a"] = {"bins": [], "samples": 480000}
+        audio = core.audio_defaults("a", 96000, 480000)
+        audio.update(source_in=1200, source_out=97123, duration_samples=240001,
+                     loop_offset_samples=99, gain=.3, fade_in_samples=111, fade_out_samples=222)
+        app.project["audio_clips"] = [audio]
+        app.project["assets"] = [{"id": "p", "path": "photo.png"}]
+        image = core.image_defaults("p", 30, 120)
+        image.update(motion=True, order=1)
+        image["from"]["zoom"] = 125
+        image["transition"] = {"type": "dissolve", "frames": 10}
+        app.project["images"] = [image]
+        metadata = {"width": 320, "height": 180, "frames": 300, "video_stream": 0,
+                    "audio_stream": 1, "has_audio": True, "rotation": 0, "video_start": 0, "audio_start": 0}
+        app.project["video_assets"] = [dict(metadata, id="v", path="video.mp4")]
+        app.video_cache["v"] = metadata
+        video = core.video_defaults("v", 60, 90)
+        video.update(source_in_frame=15, source_out_frame=75, duration_frames=180,
+                     loop_offset_frame=17, end=240, audio_enabled=True, audio_gain=.4, order=2)
+        app.project["videos"] = [video]
+        app._duration_refresh()
+        app.add_text(30)
+        text = app.project["texts"][0]
+        app.text_draft = None
+        for kind, key in (("audio", "audio_clips"), ("image", "images"), ("video", "videos"), ("text", "texts")):
+            with self.subTest(kind=kind):
+                source = app.project[key][0]
+                snapshot = copy.deepcopy(source)
+                app.selection = (kind, source["id"])
+                app.undo.clear(); app.redo.clear()
+                app.copy_selected()
+                self.assertEqual(len(app.undo), 0)
+                if kind == "audio": source["gain"] = .9
+                elif kind == "text": source["text"] = "복사 후 수정"
+                else: source["from"]["zoom"] = 200
+                app.position = 2.5
+                app.paste_clip()
+                pasted = app.project[key][-1]
+                self.assertNotEqual(pasted["id"], source["id"])
+                if kind == "audio":
+                    self.assertEqual(pasted["start_sample"], 120000)
+                    moved = {"id", "start_sample"}
+                else:
+                    self.assertEqual((pasted["start"], pasted["end"]),
+                                     (75, 75 + snapshot["end"] - snapshot["start"]))
+                    self.assertGreater(pasted["order"], source.get("order", 0))
+                    moved = {"id", "start", "end", "order"}
+                self.assertEqual({k: v for k, v in pasted.items() if k not in moved},
+                                 {k: v for k, v in snapshot.items() if k not in moved})
+                self.assertEqual(len(app.undo), 1)
+                if kind == "video": self.assertTrue(core.valid_video(app.project, pasted))
+                app.undo_action()
+                self.assertEqual(len(app.project[key]), 1)
+                app.redo_action()
+                self.assertEqual(app.project[key][-1], pasted)
+                app.text_draft = None
+                app.paste_clip()
+                self.assertEqual(len({c["id"] for c in app.project[key]}), 3)
+                if kind in ("image", "video"):
+                    app.project[key][-1]["from"]["zoom"] = 333
+                    self.assertEqual(pasted["from"]["zoom"], snapshot["from"]["zoom"])
+                app.project[key][:] = app.project[key][:1]
+                app.text_draft = None
+
+    def test_timeline_clipboard_shortcuts_commit_text_and_preserve_entry_editing(self):
+        app = EditorApp(self.root)
+        app.project["audio_assets"] = [{"id": "a", "path": "music.wav", "samples": 480000}]
+        app.project["audio_clips"] = [core.audio_defaults("a", 0, 480000)]
+        app.audio_cache["a"] = {"bins": [], "samples": 480000}
+        app._duration_refresh()
+        app.add_text(0)
+        text = app._selected()
+        box = app.text_draft[1]
+        box.delete("1.0", "end"); box.insert("1.0", "최종 문구\n두 줄")
+        app.copy_selected()
+        self.assertEqual(app.clipboard_clip[1]["text"], "최종 문구\n두 줄")
+        self.root.deiconify(); self.settle()
+        app.timeline.focus_force()
+        self.root.update()
+        app.timeline.event_generate("<Control-c>")
+        app.position = 4
+        app.timeline.event_generate("<Control-v>")
+        self.root.update_idletasks()
+        self.assertEqual(len(app.project["texts"]), 2)
+        self.assertEqual((app.project["texts"][-1]["start"], app.project["texts"][-1]["text"]),
+                         (120, "최종 문구\n두 줄"))
+        items = [i for i in app.timeline.find_all()
+                 if app.timeline.gettags(i)[:2] == ("text", app.project["texts"][-1]["id"])]
+        left, top, right, bottom = app.timeline.bbox(*items)
+        event = SimpleNamespace(x=round((left+right)/2-app.timeline.canvasx(0)),
+                                y=round((top+bottom)/2-app.timeline.canvasy(0)),
+                                state=0, x_root=200, y_root=200)
+        with patch.object(app.timeline_menu, "tk_popup") as popup:
+            app._timeline_context(event)
+        popup.assert_called_once_with(200, 200)
+        self.assertEqual(app.selection, ("text", app.project["texts"][-1]["id"]))
+        self.assertIsNone(app.drag)
+        self.assertEqual(app.timeline_menu.entrycget(0, "state"), "normal")
+        entry = ttk.Entry(app.properties)
+        for widget in (entry, box):
+            action = unittest.mock.Mock()
+            self.assertIsNone(app._shortcut(SimpleNamespace(widget=widget), action))
+            action.assert_not_called()
+        app.exporting = True
+        app.paste_clip()
+        self.assertEqual(len(app.project["texts"]), 2)
+        app.exporting = False
+        with patch.object(app, "_confirm_dirty", return_value=True):
+            app.new_project()
+        self.assertIsNone(app.clipboard_clip)
+        app.paste_clip()
+        self.assertEqual(app.project["texts"], [])
+
+    def test_media_deletion_removes_linked_clips_preserves_files_and_undoes(self):
+        app = EditorApp(self.root)
+        for kind, asset_key, clip_key in (("audio", "audio_assets", "audio_clips"),
+                                         ("image", "assets", "images"), ("video", "video_assets", "videos")):
+            with self.subTest(kind=kind):
+                app.project = core.fresh()
+                app.selection = None; app.text_draft = None
+                path = Path(self.folder.name) / {"audio": "music.wav", "image": "photo.png", "video": "video.mp4"}[kind]
+                path.touch()
+                app.project[asset_key] = [{"id": "one", "path": str(path), "samples": 480000, "frames": 300},
+                                          {"id": "two", "path": str(path), "samples": 480000, "frames": 300}]
+                make_clip = {"audio": core.audio_defaults, "image": core.image_defaults, "video": core.video_defaults}[kind]
+                end = 48000 if kind == "audio" else 30
+                app.project[clip_key] = [make_clip("one", 0, end),
+                                         make_clip("one", end, end*2 if kind == "image" else end),
+                                         make_clip("two", 0, end)]
+                app.selection = (kind, app.project[clip_key][0]["id"])
+                app.copy_selected()
+                before = copy.deepcopy(app.project)
+                app.library_selection = "one"
+                app.delete_media()
+                self.assertTrue(path.exists())
+                self.assertEqual([a["id"] for a in app.project[asset_key]], ["two"])
+                self.assertEqual([c["asset"] for c in app.project[clip_key]], ["two"])
+                self.assertIsNone(app.selection)
+                app.paste_clip()
+                self.assertEqual(len(app.project[clip_key]), 1)
+                self.assertIn("원본 미디어", app.status.get())
+                with patch.object(app, "_recheck_audio"), patch.object(app, "_recheck_videos"):
+                    app.undo_action()
+                    self.assertEqual(app.project, before)
+                    app.redo_action()
+                    self.assertEqual([c["asset"] for c in app.project[clip_key]], ["two"])
+
+    def test_deleted_pending_media_ignores_late_results_and_delete_key_uses_focus(self):
+        app = EditorApp(self.root)
+        app.project["audio_assets"] = [{"id": "a", "path": "music.wav", "samples": 0}]
+        app.project["video_assets"] = [{"id": "v", "path": "video.mp4"}]
+        app.audio_pending["a"] = 1; app.audio_generation_by_id["a"] = 1
+        app.video_pending["v"] = 2; app.video_generation_by_id["v"] = 2
+        app.video_progress["v"] = (0, "영상 정보 확인")
+        app.library_selection = "a"
+        app.delete_media()
+        app.library_selection = "v"
+        app.delete_media()
+        self.assertFalse(app.audio_pending or app.video_pending)
+        self.assertEqual(str(app.cancel_button.cget("state")), "disabled")
+        app.events.put(("audio_ready_v2", "a", 1, "unused.pcm", [], 48000))
+        app.events.put(("video_ready", "v", 2, {}))
+        app.events.put(("video_progress", "v", 2, 99, "마무리"))
+        app._poll()
+        self.assertFalse(app.audio_cache or app.video_cache)
+        self.assertFalse(app.project["audio_assets"] or app.project["video_assets"])
+        app.project["assets"] = [{"id": "p", "path": "photo.png"}]
+        app.project["images"] = [core.image_defaults("p", 0, 30)]
+        self.root.deiconify(); self.settle()
+        with patch.object(app.media_menu, "tk_popup") as popup:
+            app._library_context("p", SimpleNamespace(x_root=200, y_root=200))
+        popup.assert_called_once_with(200, 200)
+        self.assertIsNone(app.library_drag)
+        app.library_canvas.focus_force(); self.root.update()
+        app.library_canvas.event_generate("<Delete>")
+        self.assertEqual(app.project["assets"], [])
+        self.assertEqual(app.project["images"], [])
 
     def test_property_scrollbar_stays_visible_and_hint_tracks_hidden_content(self):
         app = EditorApp(self.root)

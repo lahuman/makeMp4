@@ -86,6 +86,9 @@ def prepare_video(path, ffmpeg, ffprobe, cancel, cache_dir=None, progress=None):
         if (Path(cached["proxy"]).is_file() and Path(cached["thumbnail"]).is_file()
                 and (not cached["has_audio"] or Path(cached["pcm"]).stat().st_size == cached["frames"]*(core.RATE//core.FPS)*8)):
             if cancel.is_set(): raise core.EditorError("영상 분석을 취소했습니다.")
+            peaks = cached.get("bins", [])
+            stride = max(1, math.ceil(len(peaks)/core.MAX_WAVEFORM_BINS))
+            cached["bins"] = array("f", (max(peaks[i:i+stride]) for i in range(0,len(peaks),stride)))
             report(100, "가져오기 완료")
             return cached
     except (OSError, ValueError, KeyError, TypeError): pass
@@ -113,7 +116,7 @@ def prepare_video(path, ffmpeg, ffprobe, cancel, cache_dir=None, progress=None):
         if frames <= 0: raise core.EditorError("디코딩할 영상 프레임이 없습니다.")
         core._run_encoder([ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-y",
                            "-i", str(parts["proxy"]), "-frames:v", "1", str(parts["thumbnail"])], cancel)
-        bins = []
+        bins = array("f")
         if info["has_audio"]:
             report(82, "소리 추출")
             delay = info["audio_start"] - info["video_start"]
@@ -128,12 +131,8 @@ def prepare_video(path, ffmpeg, ffprobe, cancel, cache_dir=None, progress=None):
             if parts["pcm"].stat().st_size != samples*8:
                 raise core.EditorError("영상 오디오 길이가 일치하지 않습니다.")
             report(94, "파형 분석")
-            with parts["pcm"].open("rb") as stream:
-                while raw := stream.read((core.RATE//100)*8):
-                    if cancel.is_set(): raise core.EditorError("영상 분석을 취소했습니다.")
-                    values = array("f"); values.frombytes(raw)
-                    bins.append(max((abs(v) for v in values), default=0))
-                    report(94 + 5 * stream.tell() / (samples * 8), "파형 분석")
+            bins = core.collect_waveform(parts["pcm"], samples, cancel,
+                                         progress=lambda fraction: report(94+5*fraction, "파형 분석"))
         report(99, "마무리")
         if cancel.is_set(): raise core.EditorError("영상 분석을 취소했습니다.")
         for kind in parts:
@@ -143,7 +142,7 @@ def prepare_video(path, ffmpeg, ffprobe, cancel, cache_dir=None, progress=None):
                     pcm=str(final["pcm"]) if info["has_audio"] else None)
         temp_manifest = folder / f"{key}.{token}.part.json"
         parts["manifest"] = temp_manifest
-        temp_manifest.write_text(json.dumps(info), encoding="utf-8")
+        temp_manifest.write_text(json.dumps(dict(info, bins=list(bins))), encoding="utf-8")
         os.replace(temp_manifest, manifest)
         report(100, "가져오기 완료")
         return info
@@ -168,7 +167,8 @@ class VideoDecoder:
         self.close()
         self.finished = threading.Event()
         self.errors = []
-        command = [self.ffmpeg, "-hide_banner", "-nostdin", "-v", "error"]
+        command = [self.ffmpeg, "-hide_banner", "-nostdin", "-v", "error",
+                   "-threads", "2", "-filter_threads", "2"]
         if self.preview:
             command += ["-ss", f"{number/core.FPS:.9f}", "-i", self.asset["proxy"], "-map", "0:v:0"]
             filters = f"scale={self.width}:{self.height},setsar=1"
@@ -176,7 +176,8 @@ class VideoDecoder:
             command += ["-i", self.asset["path"], "-map", f"0:{self.asset['video_stream']}"]
             # Normalize before trimming to preserve the same VFR frame selection as the proxy.
             filters = NORMALIZE + f",trim=start_frame={number},scale={self.width}:{self.height},setsar=1"
-        command += ["-vf", filters, "-an", "-f", "rawvideo", "-pix_fmt", "rgb24", "-fps_mode", "passthrough", "pipe:1"]
+        command += ["-vf", filters, "-an", "-f", "rawvideo", "-pix_fmt", "rgb24",
+                    "-threads", "1", "-fps_mode", "passthrough", "pipe:1"]
         try:
             self.process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                             stderr=subprocess.PIPE, creationflags=FLAGS)
@@ -203,14 +204,11 @@ class VideoDecoder:
             self._open(number)
         while self.number < number:
             count = self.width*self.height*3
-            raw = bytearray()
-            while len(raw) < count:
-                data = self.process.stdout.read(count-len(raw))
-                if not data:
-                    if self.cancel.is_set(): raise core.EditorError("작업을 취소했습니다.")
-                    raise core.EditorError("영상 프레임을 읽지 못했습니다. 원본을 다시 연결하세요.\n" + "".join(self.errors)[-500:])
-                raw.extend(data)
-            self.image = Image.frombytes("RGB", (self.width, self.height), bytes(raw))
+            raw = self.process.stdout.read(count)
+            if len(raw) != count:
+                if self.cancel.is_set(): raise core.EditorError("작업을 취소했습니다.")
+                raise core.EditorError("영상 프레임을 읽지 못했습니다. 원본을 다시 연결하세요.\n" + "".join(self.errors)[-500:])
+            self.image = Image.frombytes("RGB", (self.width, self.height), raw)
             self.number += 1
         return self.image
 
@@ -243,7 +241,11 @@ class VideoFrameProvider:
         asset = self.assets.get(clip["asset"])
         if not asset: raise core.EditorError("영상 원본을 찾을 수 없습니다.")
         if clip["id"] not in self.decoders:
+            if self.preview and len(self.decoders) >= 2:
+                self.decoders.pop(next(iter(self.decoders))).close()
             self.decoders[clip["id"]] = VideoDecoder(asset, self.ffmpeg, self.cancel, self.preview)
+        decoder = self.decoders.pop(clip["id"])
+        self.decoders[clip["id"]] = decoder
         number = clip["source_in_frame"] + ((clip.get("loop_offset_frame", 0) + frame - clip["start"])
                                            % (clip["source_out_frame"] - clip["source_in_frame"]))
         return self.decoders[clip["id"]].get(number)

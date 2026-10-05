@@ -14,7 +14,7 @@ import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 import wave
 
-from PIL import ImageTk
+from PIL import Image, ImageTk
 
 import editor_core as core
 from studio_theme import install_studio_controls
@@ -273,23 +273,34 @@ class EditorApp:
         ttk.Combobox(search_row, textvariable=self.library_view, state="readonly", width=7,
                      values=("썸네일", "목록")).pack(side="right", padx=(5, 0))
         filters = ttk.Frame(left, padding=(12, 10)); filters.pack(fill="x")
-        for name in ("전체", "영상", "사진"):
+        for index, name in enumerate(("전체", "음악", "영상", "사진")):
             ttk.Radiobutton(filters, text=name, value=name, variable=self.library_filter,
-                            style="Chip.TRadiobutton").pack(side="left", padx=(0, 4))
+                            style="Chip.TRadiobutton").grid(row=index//2, column=index%2,
+                                                            sticky="ew", padx=2, pady=2)
+        filters.columnconfigure((0, 1), weight=1, uniform="media-filter")
+        # Reserve the footer before the expanding canvas can consume its space.
+        media_actions = ttk.Frame(left, style="Panel.TFrame")
+        media_actions.pack(side="bottom", fill="x", padx=12, pady=12)
+        media_actions.columnconfigure(0, weight=1)
+        ttk.Button(media_actions, text="선택 미디어 추가", style="Tint.TButton",
+                   command=self.add_selected_asset).grid(row=0, column=0, sticky="ew")
+        if hasattr(self, "delete_media"):
+            ttk.Button(media_actions, text="삭제", style="Danger.TButton",
+                       command=self.delete_media).grid(row=0, column=1, padx=(4, 0))
+        self.audio_info.pack(side="bottom", fill="x")
+        ttk.Separator(left).pack(side="bottom", fill="x", padx=14)
         library_wrap = ttk.Frame(left, style="Panel.TFrame"); library_wrap.pack(fill="both", expand=True)
-        self.library_canvas = tk.Canvas(library_wrap, highlightthickness=0, bg=UI_COLORS["surface"])
-        self.library_canvas.pack(side="left", fill="both", expand=True)
-        library_scroll = ttk.Scrollbar(library_wrap, orient="vertical", command=self.library_canvas.yview)
-        library_scroll.pack(side="right", fill="y")
-        self.library_canvas.configure(yscrollcommand=library_scroll.set)
+        library_wrap.columnconfigure(0, weight=1)
+        library_wrap.rowconfigure(0, weight=1)
+        self.library_canvas = tk.Canvas(library_wrap, height=1, highlightthickness=0, bg=UI_COLORS["surface"])
+        self.library_canvas.grid(row=0, column=0, sticky="nsew")
+        self.library_scrollbar = ttk.Scrollbar(library_wrap, orient="vertical", command=self.library_canvas.yview)
+        self.library_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.library_canvas.configure(yscrollcommand=self.library_scrollbar.set)
         self.library_frame = ttk.Frame(self.library_canvas, style="Panel.TFrame")
         self.library_window = self.library_canvas.create_window((0, 0), window=self.library_frame, anchor="nw")
         self.library_frame.bind("<Configure>", lambda e: self.library_canvas.configure(scrollregion=self.library_canvas.bbox("all")))
         self.library_canvas.bind("<Configure>", lambda e: self.library_canvas.itemconfigure(self.library_window, width=e.width))
-        ttk.Separator(left).pack(fill="x", padx=14)
-        self.audio_info.pack(fill="x")
-        ttk.Button(left, text="선택 미디어를 재생 위치에 추가", style="Tint.TButton",
-                   command=self.add_selected_asset).pack(fill="x", padx=12, pady=12)
         center = ttk.Frame(body, style="Workspace.TFrame")
         center.pack_propagate(False)
         body.add(center, weight=5)
@@ -521,13 +532,17 @@ class EditorApp:
                     *((("영상 가져오기", self.choose_video),) if hasattr(self, "choose_video") else ()),
                     ("MP4 내보내기", self.start_export))),
             ("편집", (("실행 취소", self.undo_action), ("다시 실행", self.redo_action),
+                    *((("복사", self.copy_selected), ("붙여넣기", self.paste_clip))
+                      if hasattr(self, "copy_selected") else ()),
                     ("복제", self.duplicate_selected), ("삭제", self.delete_selected))),
             ("보기", (("프로젝트 패널", lambda: self.toggle_panel("left")),
                     ("속성 패널", lambda: self.toggle_panel("right")),
                     ("전체 길이 맞춤", self.fit_zoom), ("기본 배치 복원", self.reset_layout)))):
             sub = tk.Menu(parent, tearoff=False, bg=UI_COLORS["surface"], fg=UI_COLORS["text"],
                           activebackground=UI_COLORS["primary_tint"], activeforeground=UI_COLORS["text"])
-            for label, action in entries: sub.add_command(label=label, command=action)
+            for label, action in entries:
+                sub.add_command(label=label, command=action,
+                                accelerator={"복사": "Ctrl+C", "붙여넣기": "Ctrl+V"}.get(label, ""))
             ttk.Menubutton(parent, text=title, menu=sub, style="Chrome.TMenubutton").pack(side="left", padx=(0, 4))
 
     def toggle_panel(self, side):
@@ -587,58 +602,74 @@ class EditorApp:
 
     def _refresh_library(self):
         videos = self.project.get("video_assets", [])
+        audios = self.project.get("audio_assets", [])
+        video_ids = {a["id"] for a in videos}
+        audio_ids = {a["id"] for a in audios}
         cache = getattr(self, "video_cache", {})
-        self._library_signature = (tuple((a["id"], a["path"], a["id"] in cache)
-                                        for a in self.project["assets"] + videos),
+        audio_cache = getattr(self, "audio_cache", {})
+        self._library_signature = (tuple((a["id"], a["path"], a["id"] in cache or a["id"] in audio_cache)
+                                        for a in self.project["assets"] + videos + audios),
                                    self.project_search.get(), self.library_view.get())
         for child in self.library_frame.winfo_children(): child.destroy()
         self.thumb_refs.clear()
         self.library_markers.clear()
         self.library_video_progress = {}
+        self.audio_rows = {}
         query = self.project_search.get().casefold().strip()
         icon_view = self.library_view.get() == "썸네일"
         shown = 0
-        for a in self.project["assets"] + videos:
-            if self.library_filter.get() == "사진" and a in videos: continue
-            if self.library_filter.get() == "영상" and a not in videos: continue
+        for a in audios + self.project["assets"] + videos:
+            is_audio, is_video = a["id"] in audio_ids, a["id"] in video_ids
+            kind = "음악" if is_audio else "영상" if is_video else "사진"
+            if self.library_filter.get() not in ("전체", kind): continue
             if query and query not in Path(a["path"]).name.casefold(): continue
             selected = a["id"] == self.library_selection
             row = ttk.Frame(self.library_frame, padding=8,
                             style="Selected.TFrame" if selected else "Library.TFrame")
-            if icon_view:
+            if icon_view and not is_audio:
                 row.grid(row=shown//2, column=shown%2, sticky="nsew", padx=4, pady=4)
             else:
-                row.grid(row=shown, column=0, columnspan=2, sticky="ew", padx=4, pady=2)
-            shown += 1
-            try:
-                from PIL import Image, ImageOps
-                path = Path(cache[a["id"]]["thumbnail"] if a in videos else a["path"])
-                key = (str(path), path.stat().st_mtime_ns, icon_view)
-                photo = self.thumbnail_cache.get(key)
-                if photo is None:
-                    with Image.open(path) as src:
-                        im = ImageOps.exif_transpose(src).convert("RGBA")
-                        im.thumbnail((96, 64) if icon_view else (42, 32))
+                row.grid(row=shown//2 if icon_view else shown, column=0, columnspan=2,
+                         sticky="ew", padx=4, pady=2)
+            shown += 2 if icon_view and is_audio else 1
+            if is_audio:
+                thumb = ttk.Label(row, text="♫", width=2,
+                                  style="Selected.TLabel" if selected else "TLabel")
+            else:
+                try:
+                    path = Path(cache[a["id"]]["thumbnail"] if is_video else a["path"])
+                    key = (str(path), path.stat().st_mtime_ns, icon_view)
+                    photo = self.thumbnail_cache.get(key)
+                    if photo is None:
+                        im = core.thumbnail_image(path,(96,64) if icon_view else (42,32))
                         bg = Image.new("RGBA", im.size, "black"); bg.alpha_composite(im)
                         photo = ImageTk.PhotoImage(bg, master=self.root)
-                    if len(self.thumbnail_cache) > 180: self.thumbnail_cache.clear()
-                    self.thumbnail_cache[key] = photo
-                self.thumb_refs.append(photo)
-                thumb = ttk.Label(row, image=photo,
-                                  style="Selected.TLabel" if selected else "TLabel")
-            except Exception:
-                thumb = ttk.Label(row, text="영상" if a in videos else "이미지 없음", width=10,
-                                  style="Selected.TLabel" if selected else "TLabel")
-            thumb.pack(side="top" if icon_view else "left")
-            label = ttk.Label(row, text=(("▷ " + Path(a["path"]).name + "\n" +
-                                         (clock(a.get("frames", 0)/core.FPS) if a["id"] in cache else self._video_import_caption(a["id"])))
-                                        if a in videos else Path(a["path"]).name), wraplength=108 if icon_view else 165,
+                        if len(self.thumbnail_cache) > 180: self.thumbnail_cache.clear()
+                        self.thumbnail_cache[key] = photo
+                    self.thumb_refs.append(photo)
+                    thumb = ttk.Label(row, image=photo,
+                                      style="Selected.TLabel" if selected else "TLabel")
+                except Exception:
+                    thumb = ttk.Label(row, text="영상" if is_video else "이미지 없음", width=10,
+                                      style="Selected.TLabel" if selected else "TLabel")
+            thumb.pack(side="top" if icon_view and not is_audio else "left")
+            caption = Path(a["path"]).name
+            if is_audio:
+                caption += "  " + ("✓" if a["id"] in audio_cache else "…")
+            elif is_video:
+                caption = "▷ " + caption + "\n" + (clock(a.get("frames", 0)/core.FPS)
+                          if a["id"] in cache else self._video_import_caption(a["id"]))
+            label = ttk.Label(row, text=caption,
+                              wraplength=140 if is_audio else 108 if icon_view else 165,
                               style="Selected.TLabel" if selected else "TLabel")
-            label.pack(side="top" if icon_view else "left", padx=5)
-            if a in videos and a["id"] not in cache:
+            label.pack(side="top" if icon_view and not is_audio else "left", padx=5)
+            if is_audio: self.audio_rows[a["id"]] = label
+            if is_video and a["id"] not in cache:
                 self.library_video_progress[a["id"]] = (label, Path(a["path"]).name)
             for widget in (row, thumb, label):
                 widget.bind("<ButtonPress-1>", lambda e, ident=a["id"]: self._library_down(ident))
+                if hasattr(self, "_library_context"):
+                    widget.bind("<Button-3>", lambda e, ident=a["id"]: self._library_context(ident, e))
             marker = ttk.Label(row, text="●" if selected else "",
                                background=UI_COLORS["primary_tint"] if selected else UI_COLORS["surface"],
                                foreground=UI_COLORS["primary"])

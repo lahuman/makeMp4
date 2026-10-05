@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+from concurrent.futures import ThreadPoolExecutor
 import math
 import os
 from pathlib import Path
@@ -28,7 +29,10 @@ class EditorApp(BaseEditor):
         self.video_generation_by_id = {}
         self.video_pending = {}
         self.video_progress = {}
-        self.video_threads = []
+        self.media_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="media-import")
+        self.audio_pending = {}
+        self.media_job_cancels = {}
+        self.layer_cache = core.LayerCache(16*1024*1024)
         self.preview_cancel = threading.Event()
         self.preview_requests = queue.Queue(maxsize=1)
         self.preview_thread = None
@@ -43,15 +47,13 @@ class EditorApp(BaseEditor):
         self.composition_dialog = None
         self.composition_rows = {}
         self.text_draft = None
+        self.clipboard_clip = None
         self.revision = 0
         self.motion_key = tk.StringVar(value="from")
         super().__init__(root)
         self.drag = None
         self.pcm = None
         self.bins = []
-        self.audio_list = ttk.Frame(self.left, style="Panel.TFrame")
-        self.audio_list.pack(fill="x", after=self.audio_info, padx=14, pady=(0, 5))
-        self.audio_rows = {}
         self.text_source = ttk.Label(self.timeline_bar, text="문구 드래그 ↘",
                                      style="Drag.TLabel", cursor="fleur")
         self.text_source.pack(side="left", padx=6)
@@ -65,6 +67,17 @@ class EditorApp(BaseEditor):
                                ("영상 모두 이어 붙이기", self.append_all_videos)):
             self.arrange_menu.add_command(label=label, command=command)
         self.arrange_button.configure(menu=self.arrange_menu)
+        self.root.bind("<Control-c>", lambda e: self._shortcut(e, self.copy_selected))
+        self.root.bind("<Control-v>", lambda e: self._shortcut(e, self.paste_clip))
+        self.timeline_menu = tk.Menu(self.root, tearoff=False, bg=UI_COLORS["surface"],
+                                     fg=UI_COLORS["text"], activebackground=UI_COLORS["primary_tint"])
+        self.timeline_menu.add_command(label="복사", accelerator="Ctrl+C", command=self.copy_selected)
+        self.timeline_menu.add_command(label="재생 위치에 붙여넣기", accelerator="Ctrl+V", command=self.paste_clip)
+        self.timeline.bind("<Button-3>", self._timeline_context)
+        self.media_menu = tk.Menu(self.root, tearoff=False, bg=UI_COLORS["surface"],
+                                  fg=UI_COLORS["text"], activebackground=UI_COLORS["primary_tint"])
+        self.media_menu.add_command(label="재생 위치에 추가", command=self.add_selected_asset)
+        self.media_menu.add_command(label="미디어 삭제", command=self.delete_media)
         self.text_source.bind("<ButtonPress-1>", lambda e: self._library_start("text", None, e))
         self.preview.bind("<Alt-MouseWheel>", self._image_wheel)
         self.preview.bind("<Motion>", self._preview_hover)
@@ -96,11 +109,10 @@ class EditorApp(BaseEditor):
 
     def _refresh(self, properties=True):
         self._duration_refresh()
-        signature = (tuple((a["id"], a["path"], a["id"] in self.video_cache)
-                           for a in self.project["assets"] + self.project.get("video_assets", [])),
+        signature = (tuple((a["id"], a["path"], a["id"] in self.video_cache or a["id"] in self.audio_cache)
+                           for a in self.project["assets"] + self.project.get("video_assets", []) + self.project["audio_assets"]),
                      self.project_search.get(), self.library_view.get())
         if signature != self._library_signature: self._refresh_library()
-        self._refresh_audio_list()
         self.draw_timeline(); self.render_preview()
         if properties: self._show_properties()
         self.duration_label.configure(text="영상 " + clock(self.duration))
@@ -110,18 +122,6 @@ class EditorApp(BaseEditor):
         self._refresh_project_heading()
         if self.composition_dialog and self.composition_dialog.winfo_exists():
             self._refresh_composition()
-
-    def _refresh_audio_list(self):
-        for child in self.audio_list.winfo_children(): child.destroy()
-        self.audio_rows.clear()
-        for asset in self.project["audio_assets"]:
-            ready = asset["id"] in self.audio_cache
-            state = "✓" if ready else "…"
-            label = ttk.Label(self.audio_list, text=f"♫ {Path(asset['path']).name}  {state}",
-                              cursor="hand2", wraplength=220)
-            label.pack(fill="x", pady=2)
-            label.bind("<ButtonPress-1>", lambda e, ident=asset["id"]: self._library_start("audio", ident, e))
-            self.audio_rows[asset["id"]] = label
 
     def _commit_text_draft(self):
         draft = self.text_draft
@@ -439,19 +439,20 @@ class EditorApp(BaseEditor):
         self.video_generation_by_id[asset["id"]] = token
         self.video_pending[asset["id"]] = token
         self.video_progress[asset["id"]] = (0, "영상 정보 확인")
-        cancel = self.video_cancel
+        cancel = threading.Event()
+        self.media_job_cancels[asset["id"]] = cancel
         ident, path = asset["id"], asset["path"]
         self._update_video_import_display()
         def worker():
             try:
+                if cancel.is_set() or self.video_generation_by_id.get(ident) != token:
+                    raise core.EditorError("영상 분석을 취소했습니다.")
                 prepared = video_media.prepare_video(path, ffmpeg, ffprobe, cancel,
                     progress=lambda percent, stage: self.events.put(("video_progress", ident, token, percent, stage)))
                 self.events.put(("video_ready", ident, token, prepared))
             except Exception as e:
                 self.events.put(("video_error", ident, token, str(e)))
-        thread = threading.Thread(target=worker, daemon=True)
-        self.video_threads = [t for t in self.video_threads if t.is_alive()]
-        self.video_threads.append(thread); thread.start()
+        self.media_executor.submit(worker)
 
     def _recheck_videos(self):
         for asset in self.project.get("video_assets", []):
@@ -465,12 +466,23 @@ class EditorApp(BaseEditor):
                                                    "has_audio","rotation","video_start","audio_start")})
 
     def _video_job_finished(self, ident):
+        self.media_job_cancels.pop(ident, None)
         self.video_pending.pop(ident, None)
         self.video_progress.pop(ident, None)
         if self.video_pending:
             self._update_video_import_display()
         else:
             self.progressbar.stop(); self.cancel_button.configure(state="disabled"); self._show_job_controls()
+            self._update_audio_import_display()
+
+    def _update_audio_import_display(self):
+        if self.video_pending:
+            self._update_video_import_display()
+        elif self.audio_pending:
+            self.cancel_button.configure(state="normal")
+            self.progressbar.configure(mode="indeterminate"); self.progressbar.start(12)
+            self._show_job_controls(running=True)
+            self.status.set(f"음원 분석 중… 남은 파일 {len(self.audio_pending)}개")
 
     def _update_video_import_display(self):
         for ident, (label, name) in getattr(self, "library_video_progress", {}).items():
@@ -515,18 +527,25 @@ class EditorApp(BaseEditor):
 
     def _dispose_videos(self):
         self.video_cancel.set(); self.preview_cancel.set()
+        self.audio_cancel.set()
+        for cancel in self.media_job_cancels.values(): cancel.set()
+        self.media_job_cancels.clear()
+        self.media_executor.shutdown(wait=True, cancel_futures=True)
+        self.media_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="media-import")
+        self.audio_pending.clear(); self.audio_generation_by_id.clear()
+        self.layer_cache = core.LayerCache(16*1024*1024)
         self.video_generation_by_id.clear()
         self.video_pending.clear()
         self.video_progress.clear()
         if self.preview_thread: self.preview_thread.join(timeout=3)
-        for thread in self.video_threads: thread.join(timeout=3)
-        self.video_threads.clear(); self.video_cache.clear()
+        self.video_cache.clear()
         self.preview_thread = None
         self.preview_requests = queue.Queue(maxsize=1)
         self.preview_cancel = threading.Event()
         self.preview_requested = None; self.video_preview_key = None; self.video_preview_picture = None
 
     def _request_video_preview(self, key, frame):
+        if self.exporting: return
         if key == self.preview_requested: return
         assets = []
         for asset in self.project["video_assets"]:
@@ -539,17 +558,20 @@ class EditorApp(BaseEditor):
             cancel, requests = self.preview_cancel, self.preview_requests
             def worker():
                 provider = None; signature = None
+                cache = core.LayerCache(16*1024*1024)
                 try:
                     while not cancel.is_set():
                         try: request_key, snapshot, number, prepared = requests.get(timeout=.1)
-                        except queue.Empty: continue
+                        except queue.Empty:
+                            if provider: provider.close()
+                            continue
                         new_signature = tuple((a["id"], a["path"], a["proxy"]) for a in prepared)
                         if new_signature != signature:
                             if provider: provider.close()
                             provider = video_media.VideoFrameProvider(prepared, ffmpeg, cancel, preview=True)
                             signature = new_signature
                         try:
-                            picture = core.render_scene(snapshot, number, video_frames=provider)
+                            picture = core.render_scene(snapshot, number, video_frames=provider, cache=cache)
                             self.events.put(("video_preview", request_key, picture))
                         except Exception as e:
                             if not cancel.is_set(): self.events.put(("video_preview_error", request_key, str(e)))
@@ -562,7 +584,9 @@ class EditorApp(BaseEditor):
         self.preview_requests.put_nowait((key, copy.deepcopy(self.project), frame, assets))
 
     def cancel_job(self):
-        if not self.exporting: self.video_cancel.set()
+        if not self.exporting:
+            self.video_cancel.set()
+            for cancel in self.media_job_cancels.values(): cancel.set()
         super().cancel_job()
 
     def choose_audio(self):
@@ -584,11 +608,16 @@ class EditorApp(BaseEditor):
         self._refresh()
 
     def _analyze_asset(self, asset):
+        if asset["id"] in self.audio_pending: return
+        try: ffmpeg, ffprobe = self.tool("ffmpeg"), self.tool("ffprobe")
+        except core.EditorError as e: messagebox.showerror("음원 오류", str(e)); return
         if self.audio_cancel.is_set(): self.audio_cancel = threading.Event()
         self.audio_token += 1
         token = self.audio_token
         self.audio_generation_by_id[asset["id"]] = token
-        cancel = self.audio_cancel
+        self.audio_pending[asset["id"]] = token
+        cancel = threading.Event()
+        self.media_job_cancels[asset["id"]] = cancel
         self.cancel_button.configure(state="normal")
         self.progressbar.configure(mode="indeterminate"); self.progressbar.start(12)
         self._show_job_controls(running=True)
@@ -596,14 +625,15 @@ class EditorApp(BaseEditor):
         if self.video_pending: self._update_video_import_display()
         def worker():
             try:
-                core.probe_audio(asset["path"], self.tool("ffprobe"))
-                pcm, bins, samples = core.analyze_audio_asset(asset["path"], self.tool("ffmpeg"), cancel)
+                if cancel.is_set() or self.audio_generation_by_id.get(asset["id"]) != token:
+                    raise core.EditorError("음악 분석을 취소했습니다.")
+                core.probe_audio(asset["path"], ffprobe, cancel)
+                pcm, bins, samples = core.analyze_audio_asset(asset["path"], ffmpeg, cancel)
                 self.events.put(("audio_ready_v2", asset["id"], token, pcm, bins, samples))
             except Exception as e:
                 self.events.put(("audio_cancel_v2" if cancel.is_set() else "audio_error_v2",
                                  asset["id"], token, str(e)))
-        self.audio_thread = threading.Thread(target=worker, daemon=True)
-        self.audio_thread.start()
+        self.media_executor.submit(worker)
 
     def _recheck_audio(self):
         for asset in self.project["audio_assets"]:
@@ -631,11 +661,61 @@ class EditorApp(BaseEditor):
 
     def _library_down(self, ident):
         self._commit_text_draft()
+        self.library_canvas.focus_set()
+        self.selection = None
         self.library_selection = ident
-        kind = "video" if any(a["id"] == ident for a in self.project["video_assets"]) else "image"
+        kind = ("audio" if any(a["id"] == ident for a in self.project["audio_assets"]) else
+                "video" if any(a["id"] == ident for a in self.project["video_assets"]) else "image")
         self._library_start(kind, ident, None)
         self._refresh_library()
         self._show_properties()
+        self.render_preview()
+        self.draw_timeline()
+
+    def _library_context(self, ident, event):
+        self._library_down(ident)
+        self.library_drag = None
+        try: self.media_menu.tk_popup(event.x_root, event.y_root)
+        finally: self.media_menu.grab_release()
+
+    def delete_media(self):
+        if not self._editable(): return
+        self._commit_text_draft()
+        for kind, asset_key, clip_key in (("audio", "audio_assets", "audio_clips"),
+                                         ("image", "assets", "images"),
+                                         ("video", "video_assets", "videos")):
+            asset = next((a for a in self.project[asset_key] if a["id"] == self.library_selection), None)
+            if asset is None: continue
+            self._stop_audio()
+            self._change()
+            self.project[asset_key].remove(asset)
+            cancel = self.media_job_cancels.pop(asset["id"], None)
+            if cancel: cancel.set()
+            clips = self.project[clip_key]
+            removed = sum(c["asset"] == asset["id"] for c in clips)
+            clips[:] = [c for c in clips if c["asset"] != asset["id"]]
+            if kind == "audio":
+                self.audio_cache.pop(asset["id"], None)
+                self.audio_pending.pop(asset["id"], None)
+                self.audio_generation_by_id.pop(asset["id"], None)
+            elif kind == "video":
+                self.video_cache.pop(asset["id"], None)
+                self.video_pending.pop(asset["id"], None)
+                self.video_generation_by_id.pop(asset["id"], None)
+                self.video_progress.pop(asset["id"], None)
+            self.library_selection = None
+            self.library_drag = None
+            if self.selection and self._selected() is None: self.selection = None
+            self._refresh()
+            if self.audio_pending or self.video_pending:
+                self._update_audio_import_display()
+            else:
+                self.progressbar.stop()
+                self.cancel_button.configure(state="disabled")
+                self._show_job_controls()
+            self.status.set(f"{Path(asset['path']).name} · 미디어와 클립 {removed}개 삭제. Ctrl+Z로 복원할 수 있습니다.")
+            return
+        self.status.set("미디어 목록에서 삭제할 파일을 선택하세요.")
 
     def _library_start(self, kind, ident, event):
         self._commit_text_draft()
@@ -700,6 +780,8 @@ class EditorApp(BaseEditor):
         else: self.add_text(frame)
 
     def add_selected_asset(self):
+        if any(a["id"] == self.library_selection for a in self.project["audio_assets"]):
+            self.place_audio(self.library_selection, round(self.position*core.FPS)); return
         if any(a["id"] == self.library_selection for a in self.project["video_assets"]):
             if self.library_selection not in self.video_cache:
                 asset = next(a for a in self.project["video_assets"] if a["id"] == self.library_selection)
@@ -783,6 +865,8 @@ class EditorApp(BaseEditor):
         self.project["texts"].append(item); self.selection = ("text", item["id"]); self._refresh()
 
     def delete_selected(self):
+        if self.root.focus_get() == self.library_canvas:
+            self.delete_media(); return
         self._commit_text_draft()
         item = self._selected()
         if not item or not self._editable(): return
@@ -790,6 +874,47 @@ class EditorApp(BaseEditor):
                       "video": self.project["videos"],
                       "text": self.project["texts"]}[self.selection[0]]
         self._change(); collection.remove(item); self.selection = None; self._refresh()
+
+    def copy_selected(self):
+        self._commit_text_draft()
+        item = self._selected()
+        if item is None:
+            self.status.set("타임라인에서 복사할 클립을 선택하세요."); return
+        self.clipboard_clip = (self.selection[0], copy.deepcopy(item))
+        self.status.set("클립을 복사했습니다. 재생 위치를 정한 뒤 Ctrl+V로 붙여넣으세요.")
+
+    def paste_clip(self):
+        if not self._editable(): return
+        if self.clipboard_clip is None:
+            self.status.set("먼저 타임라인 클립을 복사하세요."); return
+        self._commit_text_draft()
+        kind, original = self.clipboard_clip
+        if kind != "text":
+            asset_key = {"audio": "audio_assets", "image": "assets", "video": "video_assets"}[kind]
+            asset = next((a for a in self.project[asset_key] if a["id"] == original["asset"]), None)
+            if asset is None:
+                self.status.set("복사한 클립의 원본 미디어가 프로젝트에 없습니다."); return
+        trial = copy.deepcopy(original)
+        trial["id"] = core.uid()
+        collection = self.project[{"audio": "audio_clips", "image": "images", "video": "videos", "text": "texts"}[kind]]
+        if kind == "audio":
+            trial["start_sample"] = max(0, round(self.position*core.RATE))
+            valid = core.valid_audio(self.project, trial) and trial["source_out"] <= asset.get("samples", 0)
+        else:
+            trial["start"] = max(0, round(self.position*core.FPS))
+            trial["end"] = trial["start"] + original["end"] - original["start"]
+            trial["order"] = (max((t.get("order", 0) for t in collection), default=0)+1
+                              if kind == "text" else core.next_visual_order(self.project))
+            valid = core.valid_video(self.project, trial) if kind == "video" else True
+        if not valid:
+            self.status.set("복사한 클립의 원본 구간을 확인하세요."); return
+        self._stop_audio()
+        self._change()
+        collection.append(trial)
+        self.selection = (kind, trial["id"])
+        self._refresh()
+        self.timeline.focus_set()
+        self.status.set("재생 위치에 클립을 붙여넣었습니다.")
 
     def duplicate_selected(self):
         self._commit_text_draft()
@@ -846,6 +971,7 @@ class EditorApp(BaseEditor):
         self._dispose_videos()
         self.audio_cancel = threading.Event()
         self.project = core.fresh(); self.project_file = None; self.duration = 0; self.position = 0
+        self.clipboard_clip = None
         self.undo.clear(); self.redo.clear(); self.selection = None; self.library_selection = None
         self.dirty = False; self.revision += 1; self.scene_cache_key = None
         self._refresh()
@@ -870,6 +996,7 @@ class EditorApp(BaseEditor):
             self._dispose_videos()
             self.audio_cancel = threading.Event()
             self.project = data; self.project_file = Path(path)
+            self.clipboard_clip = None
             self._legacy_project_file = Path(path) if data.get("_migrated") else None
             self.selection = None; self.library_selection = None
             self.undo.clear(); self.redo.clear(); self.dirty = bool(missing or data.get("_migrated"))
@@ -1163,7 +1290,7 @@ class EditorApp(BaseEditor):
                     amplitude = min(40,max(15,(self.audio_lane_height-44)/2))
                     for px in range(max(int(left),int(x0)+8), min(int(right),int(x1)-8), 2):
                         source_s = clip["source_in"]/core.RATE+(px-x0)/self.zoom
-                        idx = int(source_s*100)
+                        idx = int(source_s*core.RATE/core.waveform_stride(cache["samples"]))
                         if 0 <= idx < len(bins):
                             peak = min(1,bins[idx])
                             c.create_line(px,center-peak*amplitude,px,center+peak*amplitude,
@@ -1236,10 +1363,8 @@ class EditorApp(BaseEditor):
                 key=(str(path),path.stat().st_mtime_ns,"timeline-v2")
                 photo=self.timeline_thumbnail_cache.get(key)
                 if photo is None:
-                    with Image.open(path) as source:
-                        frame_image=ImageOps.exif_transpose(source).convert("RGB")
-                        frame_image.thumbnail((42,30))
-                        photo=ImageTk.PhotoImage(frame_image,master=self.root)
+                    frame_image=core.thumbnail_image(path,(42,30),"RGB")
+                    photo=ImageTk.PhotoImage(frame_image,master=self.root)
                     if len(self.timeline_thumbnail_cache)>180: self.timeline_thumbnail_cache.clear()
                     self.timeline_thumbnail_cache[key]=photo
                 c.create_image(visible_left+8,y+h/2,anchor="w",image=photo,tags=(kind,item["id"]))
@@ -1305,6 +1430,16 @@ class EditorApp(BaseEditor):
             elif y>c.winfo_height()-30: c.yview_scroll(1,"units")
             self._timeline_move(SimpleNamespace(x=x,y=y,state=self.drag.get("state",0)),from_scroll=True)
         self._queue_drag_scroll()
+
+    def _timeline_context(self, event):
+        self._timeline_down(event)
+        self.drag = None
+        self._cancel_drag_scroll()
+        self.draw_timeline()
+        self.timeline_menu.entryconfigure(0, state="normal" if self._selected() else "disabled")
+        self.timeline_menu.entryconfigure(1, state="normal" if self.clipboard_clip and not self.exporting else "disabled")
+        try: self.timeline_menu.tk_popup(event.x_root, event.y_root)
+        finally: self.timeline_menu.grab_release()
 
     def _timeline_down(self,event):
         self._commit_text_draft(); self.timeline.focus_set()
@@ -1473,7 +1608,7 @@ class EditorApp(BaseEditor):
                     elif self.preview_ref is None:
                         self.preview_ref=ImageTk.PhotoImage(Image.new("RGB",(width,height)),master=self.root)
                 else:
-                    picture=core.render_scene(self.project,frame,self._scene_warn)
+                    picture=core.render_scene(self.project,frame,self._scene_warn,cache=self.layer_cache)
                     self.preview_ref=ImageTk.PhotoImage(picture.resize((width,height)),master=self.root)
                     self.scene_cache_key=key
             self.preview.delete("all"); self.preview.create_image(x,y,image=self.preview_ref,anchor="nw")
@@ -1655,17 +1790,14 @@ class EditorApp(BaseEditor):
         def worker():
             try:
                 import sounddevice as sd
-                from contextlib import ExitStack
                 self.play_frames=0
-                with ExitStack() as stack:
-                    streams={ident:stack.enter_context(Path(paths[ident]).open("rb")) for ident in {c["asset"] for c in clips}}
-                    stream=stack.enter_context(sd.RawOutputStream(samplerate=core.RATE,channels=2,
-                                                                   dtype="float32",blocksize=2048))
+                with core.AudioMixer(clips, paths) as mixer, \
+                        sd.RawOutputStream(samplerate=core.RATE,channels=2,dtype="float32",blocksize=2048) as stream:
                     self.play_latency=stream.latency
                     cursor=start_sample
                     while cursor<final and not cancel.is_set():
                         count=min(2048,final-cursor)
-                        raw=core.mixed_audio_chunk(clips,streams,cursor,count)
+                        raw=mixer.read(cursor,count)
                         stream.write(raw)
                         cursor+=count; self.play_frames+=count
                 if not cancel.is_set(): self.events.put(("play_end",))
@@ -1685,8 +1817,8 @@ class EditorApp(BaseEditor):
 
     def start_export(self):
         self._commit_text_draft()
-        if self.video_pending:
-            messagebox.showwarning("내보내기", "영상 준비가 끝날 때까지 기다리세요."); return
+        if self.video_pending or self.audio_pending:
+            messagebox.showwarning("내보내기", "영상·음원 준비가 끝날 때까지 기다리세요."); return
         if any(c["asset"] not in self.audio_cache for c in self.project["audio_clips"]):
             messagebox.showwarning("내보내기", "음원 분석이 끝날 때까지 기다리세요."); return
         if any(c["asset"] not in self.video_cache for c in self.project["videos"]):
@@ -1770,6 +1902,8 @@ class EditorApp(BaseEditor):
                 elif kind=="audio_ready_v2":
                     _,ident,token,pcm,bins,samples=event
                     if self.audio_generation_by_id.get(ident)!=token: continue
+                    self.media_job_cancels.pop(ident,None)
+                    self.audio_pending.pop(ident,None)
                     asset=next((a for a in self.project["audio_assets"] if a["id"]==ident),None)
                     if not asset: continue
                     asset["samples"]=samples
@@ -1782,16 +1916,21 @@ class EditorApp(BaseEditor):
                     self._refresh()
                     if not self.project["audio_clips"] and self.project["audio_assets"][0]["id"]==ident:
                         self.place_audio(ident,0)
-                    if self.video_pending: self._update_video_import_display()
+                    self._update_audio_import_display()
                 elif kind=="audio_error_v2":
                     _,ident,token,error=event
                     if self.audio_generation_by_id.get(ident)==token:
+                        self.media_job_cancels.pop(ident,None)
+                        self.audio_pending.pop(ident,None)
                         self.progressbar.stop(); self._show_job_controls()
                         self.status.set(error.splitlines()[0]); messagebox.showerror("음원 오류",error)
-                        if self.video_pending: self._update_video_import_display()
+                        self._update_audio_import_display()
                 elif kind=="audio_cancel_v2":
+                    if self.audio_generation_by_id.get(event[1])!=event[2]: continue
+                    self.media_job_cancels.pop(event[1],None)
+                    self.audio_pending.pop(event[1],None)
                     self.progressbar.stop(); self._show_job_controls(); self.status.set("음원 분석을 취소했습니다.")
-                    if self.video_pending: self._update_video_import_display()
+                    self._update_audio_import_display()
                 elif kind=="play_error":
                     self._stop_audio(); self.status.set(event[1].splitlines()[0]); messagebox.showerror("재생 오류",event[1])
                 elif kind=="play_end":
@@ -1802,6 +1941,7 @@ class EditorApp(BaseEditor):
                         self.export_status_label.configure(text=f"MP4 만드는 중… {event[1]}%")
                 elif kind=="export_done":
                     self.exporting=False; self.last_output=event[1]; self.progress.set(100)
+                    self.render_preview()
                     self.cancel_button.configure(state="disabled")
                     self.open_file.configure(state="normal"); self.open_folder.configure(state="normal")
                     self._show_job_controls(complete=True); self.status.set("완료: "+str(event[1]))
@@ -1809,6 +1949,7 @@ class EditorApp(BaseEditor):
                         self._show_export_result(event[1])
                 elif kind=="export_error":
                     self.exporting=False; self.cancel_button.configure(state="disabled")
+                    self.render_preview()
                     self._show_job_controls(); self.status.set(event[1].splitlines()[0])
                     if self.export_dialog and self.export_dialog.winfo_exists():
                         self.export_status_label.configure(text=event[1].splitlines()[0])
@@ -1825,6 +1966,7 @@ class EditorApp(BaseEditor):
         if not self._confirm_dirty(): return
         self._save_ui_settings(); self._stop_audio(); self.audio_cancel.set()
         self._dispose_videos()
+        self.media_executor.shutdown(wait=False, cancel_futures=True)
         if self.audio_thread: self.audio_thread.join(timeout=3)
         if self.play_thread: self.play_thread.join(timeout=2)
         self._dispose_pcm(); self.root.destroy()

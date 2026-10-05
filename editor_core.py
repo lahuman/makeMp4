@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import copy
 from array import array
+from collections import OrderedDict, deque
+from contextlib import contextmanager
 import hashlib
 import json
 import math
@@ -22,6 +24,8 @@ RATE = 48000
 AUDIO_EXTS = {".flac", ".wav", ".mp3"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm"}
+MAX_WAVEFORM_BINS = 60000
+MAX_COMPOSITE_FRAMES = 60
 
 
 class EditorError(Exception):
@@ -85,7 +89,8 @@ def valid_video(project, clip):
 def visual_clips(project):
     images = project["images"]
     videos = project.get("videos", [])
-    return sorted(images + videos, key=lambda c: c.get("order", images.index(c) if c in images else len(images)))
+    return [clip for _, clip in sorted(enumerate(images + videos),
+                                      key=lambda pair: pair[1].get("order", pair[0] if pair[0] < len(images) else len(images)))]
 
 
 def next_visual_order(project):
@@ -145,7 +150,9 @@ def paths_in(project, project_file):
 
 def save_project(project, path):
     path = Path(path)
-    data = copy.deepcopy(project)
+    transient = {"bins", "proxy", "proxy_width", "proxy_height", "pcm", "thumbnail"}
+    data = copy.deepcopy(dict(project, video_assets=[{k:v for k,v in asset.items() if k not in transient}
+                                                     for asset in project.get("video_assets", [])]))
     data.pop("_migrated", None)
     data.pop("_migrated_v1", None)
     def relative(value):
@@ -235,18 +242,27 @@ def migrate_v1(project):
     project["_migrated"] = True
 
 
-def probe_audio(path, ffprobe):
+def probe_audio(path, ffprobe, cancel=None):
     command = [ffprobe, "-v", "error", "-select_streams", "a:0", "-show_entries",
                "format=duration:stream=codec_name,sample_rate,channels", "-of", "json", str(path)]
     try:
-        p = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if cancel and cancel.is_set(): raise EditorError("음악 분석을 취소했습니다.")
+        with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)) as p:
+            while True:
+                try:
+                    stdout, _ = p.communicate(timeout=.1)
+                    break
+                except subprocess.TimeoutExpired:
+                    if cancel and cancel.is_set():
+                        p.kill(); p.communicate()
+                        raise EditorError("음악 분석을 취소했습니다.")
     except OSError as e:
         raise EditorError("FFprobe를 실행할 수 없습니다. 배포 폴더의 실행 파일을 확인하세요.") from e
     if p.returncode:
         raise EditorError("음악을 읽을 수 없습니다. 손상 여부와 FLAC/WAV/MP3 형식을 확인하세요.")
     try:
-        info = json.loads(p.stdout)
+        info = json.loads(stdout)
         return float(info["format"]["duration"])
     except (KeyError, IndexError, ValueError, TypeError) as e:
         raise EditorError("음악 길이를 확인할 수 없습니다.") from e
@@ -296,8 +312,33 @@ def analyze_audio(path, ffmpeg, cancel, report=None):
         raise
 
 
+def waveform_stride(samples):
+    return max(1, math.ceil(samples / ((RATE//100) * MAX_WAVEFORM_BINS))) * (RATE//100)
+
+
+def collect_waveform(path, samples, cancel, progress=None):
+    """Keep bounded float32 peaks; PCM reads never exceed 128 KiB."""
+    bins = array("f")
+    stride = waveform_stride(samples)
+    with Path(path).open("rb") as stream:
+        for start in range(0, samples, stride):
+            remaining, peak = min(stride, samples-start), 0.0
+            while remaining:
+                if cancel.is_set(): raise EditorError("작업을 취소했습니다.")
+                count = min(remaining, 16384)
+                raw = stream.read(count*8)
+                if len(raw) != count*8: raise EditorError("오디오 캐시가 짧습니다. 다시 분석하세요.")
+                values = array("f"); values.frombytes(raw)
+                peak = max(peak, max((abs(v) for v in values), default=0.0))
+                remaining -= count
+            bins.append(peak)
+            if progress: progress(min(samples, start+stride)/samples)
+    return bins
+
+
 def analyze_audio_asset(path, ffmpeg, cancel, cache_dir=None):
-    """Decode to interleaved float32 PCM on disk and collect 10 ms peak bins."""
+    """Decode PCM to disk and retain at most 240 KiB of waveform peaks."""
+    if cancel.is_set(): raise EditorError("음악 분석을 취소했습니다.")
     source = Path(path)
     stat = source.stat()
     key = hashlib.sha256(f"{source.resolve()}|{stat.st_size}|{stat.st_mtime_ns}".encode()).hexdigest()
@@ -310,41 +351,31 @@ def analyze_audio_asset(path, ffmpeg, cancel, cache_dir=None):
         folder = new_folder if new_folder.exists() or not legacy_folder.exists() else legacy_folder
     folder.mkdir(parents=True, exist_ok=True)
     pcm = folder / (key + ".f32le")
-    bins_path = folder / (key + ".json")
-    if pcm.is_file() and bins_path.is_file():
+    bins_path = folder / (key + ".peaks")
+    if pcm.is_file() and pcm.stat().st_size > 0 and pcm.stat().st_size % 8 == 0:
+        count = pcm.stat().st_size // 8
         try:
-            bins = json.loads(bins_path.read_text(encoding="utf-8"))
-            if pcm.stat().st_size % 8 == 0:
-                return str(pcm), bins, pcm.stat().st_size // 8
+            if bins_path.stat().st_size != math.ceil(count/waveform_stride(count))*4:
+                raise ValueError("waveform cache size")
+            bins = array("f"); bins.frombytes(bins_path.read_bytes())
+            return str(pcm), bins, count
         except (OSError, ValueError):
-            pass
+            bins = collect_waveform(pcm, count, cancel)
+            part = bins_path.with_name(bins_path.name + "." + uid() + ".part")
+            try:
+                part.write_bytes(bins.tobytes()); os.replace(part, bins_path)
+            finally: part.unlink(missing_ok=True)
+            return str(pcm), bins, count
     temp = folder / (key + "." + uid() + ".part")
     command = [ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-i", str(path),
                "-vn", "-ac", "2", "-ar", str(RATE), "-f", "f32le", "-c:a", "pcm_f32le", "-y", str(temp)]
     try:
-        p = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.PIPE, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        while p.poll() is None:
-            if cancel.is_set():
-                p.terminate()
-                try: p.wait(2)
-                except subprocess.TimeoutExpired: p.kill(); p.wait()
-                raise EditorError("음악 분석을 취소했습니다.")
-            cancel.wait(.1)
-        error = p.stderr.read().decode("utf-8", "replace")[-500:]
-        if p.returncode or not temp.is_file() or temp.stat().st_size == 0:
-            raise EditorError("음악 분석 실패: 파일 손상 또는 지원하지 않는 오디오를 확인하세요.\n" + error)
-        bins = []
-        block = RATE // 100
-        with temp.open("rb") as f:
-            while True:
-                if cancel.is_set(): raise EditorError("음악 분석을 취소했습니다.")
-                raw = f.read(block * 8)
-                if not raw: break
-                samples = array("f"); samples.frombytes(raw)
-                bins.append(max((abs(v) for v in samples), default=0.0))
+        _run_encoder(command, cancel)
+        if not temp.is_file() or temp.stat().st_size == 0 or temp.stat().st_size % 8:
+            raise EditorError("음악 분석 실패: 오디오 길이가 올바르지 않습니다.")
+        bins = collect_waveform(temp, temp.stat().st_size//8, cancel)
         os.replace(temp, pcm)
-        bins_path.write_text(json.dumps(bins), encoding="utf-8")
+        temp.write_bytes(bins.tobytes()); os.replace(temp, bins_path)
         return str(pcm), bins, pcm.stat().st_size // 8
     finally:
         temp.unlink(missing_ok=True)
@@ -379,20 +410,61 @@ def transform_at(cue, frame):
     return {key: first[key] + (last[key] - first[key]) * fraction for key in ("x", "y", "zoom")}
 
 
-def image_layer(project, cue, frame, video_frames=None):
-    canvas = Image.new("RGBA", SIZE, (0, 0, 0, 0))
+class LayerCache:
+    """Small LRU of output-size layers, never a collection of original images."""
+    def __init__(self, max_bytes=32*1024*1024):
+        self.max_bytes, self.bytes = max_bytes, 0
+        self.items = OrderedDict()
+
+    def get(self, key):
+        image = self.items.get(key)
+        if image is not None: self.items.move_to_end(key)
+        return image
+
+    def put(self, key, image):
+        size = image.width*image.height*len(image.getbands())
+        if size > self.max_bytes: return
+        if key in self.items:
+            old = self.items.pop(key); self.bytes -= old.width*old.height*len(old.getbands())
+        while self.items and self.bytes+size > self.max_bytes:
+            old = self.items.popitem(last=False)[1]
+            self.bytes -= old.width*old.height*len(old.getbands())
+        self.items[key] = image; self.bytes += size
+
+
+def thumbnail_image(path, size, mode="RGBA"):
+    with Image.open(path) as source:
+        rotated = source.getexif().get(274, 1) in (5,6,7,8)
+        source.draft(source.mode, size[::-1] if rotated else size)
+        ImageOps.exif_transpose(source, in_place=True)
+        source.thumbnail(size, Image.Resampling.LANCZOS)
+        return source.convert(mode)
+
+
+def image_layer(project, cue, frame, video_frames=None, cache=None):
     if "source_in_frame" in cue:
         if video_frames is None: raise EditorError("영상 디코더가 준비되지 않았습니다.")
         image = video_frames.get(cue, frame).convert("RGBA")
         return picture_layer(image, cue, frame)
     asset = next((a for a in project["assets"] if a["id"] == cue["asset"]), None)
-    if not asset: return canvas
+    if not asset: return Image.new("RGBA", SIZE, (0, 0, 0, 0))
     try:
+        key = None
+        if cache is not None and not cue.get("motion"):
+            stat = Path(asset["path"]).stat()
+            state = transform_at(cue, frame)
+            key = ("image", asset["path"], stat.st_mtime_ns, stat.st_size, SIZE,
+                   state["x"], state["y"], state["zoom"], cue.get("legacy_native", False))
+            cached = cache.get(key)
+            if cached is not None: return cached
         with Image.open(asset["path"]) as src:
-            image = ImageOps.exif_transpose(src).convert("RGBA")
+            ImageOps.exif_transpose(src, in_place=True)
+            image = src.convert("RGBA")
     except (OSError, ValueError) as e:
         raise EditorError(f"이미지를 읽을 수 없습니다: {asset['path']}\n{e}") from e
-    return picture_layer(image, cue, frame)
+    layer = picture_layer(image, cue, frame)
+    if key is not None: cache.put(key, layer)
+    return layer
 
 
 def picture_layer(image, cue, frame):
@@ -402,9 +474,15 @@ def picture_layer(image, cue, frame):
     state = transform_at(cue, frame)
     factor = fitted * max(10, min(500, float(state["zoom"]))) / 100
     width, height = max(1, round(image.width * factor)), max(1, round(image.height * factor))
-    image = image.resize((width, height), Image.Resampling.LANCZOS)
     x, y = round(state["x"] - width / 2), round(state["y"] - height / 2)
-    canvas.paste(image, (x, y))
+    left, top = max(0, x), max(0, y)
+    right, bottom = min(SIZE[0], x + width), min(SIZE[1], y + height)
+    if right <= left or bottom <= top: return canvas
+    # Resize only the visible source window, including Lanczos filter support.
+    box = ((left-x)*image.width/width, (top-y)*image.height/height,
+           (right-x)*image.width/width, (bottom-y)*image.height/height)
+    image = image.resize((right-left, bottom-top), Image.Resampling.LANCZOS, box=box)
+    canvas.paste(image, (left, top))
     return canvas
 
 
@@ -498,16 +576,16 @@ def text_box(item):
     return text_layout(item)[3]
 
 
-def render_scene(project, frame, warn=None, video_frames=None):
+def render_scene(project, frame, warn=None, video_frames=None, cache=None, visuals=None):
     """The one compositor used for the editor preview and exported stills."""
     canvas = Image.new("RGBA", SIZE, (0, 0, 0, 255))
-    visible_clips = active_visuals(project, frame)
+    visible_clips = active_visuals(project, frame) if visuals is None else visuals
     if video_frames is not None: video_frames.begin_frame(visible_clips)
     for cue in visible_clips:
-        incoming = image_layer(project, cue, frame, video_frames)
+        incoming = image_layer(project, cue, frame, video_frames, cache)
         effect, length, previous = transition_info(project, cue)
         if effect != "cut" and frame < cue["start"] + length:
-            outgoing = image_layer(project, previous, previous["end"] - 1)
+            outgoing = image_layer(project, previous, previous["end"] - 1, cache=cache)
             progress = (frame - cue["start"] + 1) / length
             if effect == "dissolve":
                 picture = Image.blend(outgoing, incoming, progress)
@@ -527,6 +605,11 @@ def render_scene(project, frame, warn=None, video_frames=None):
     visible = sorted((t for t in project["texts"] if t["start"] <= frame < t["end"]),
                      key=lambda t: t.get("order", 0))
     for item in visible:
+        key = ("text", SIZE, json.dumps(item, sort_keys=True))
+        cached = cache.get(key) if cache is not None else None
+        if cached is not None:
+            canvas = Image.alpha_composite(canvas, cached)
+            continue
         layer = Image.new("RGBA", SIZE, (0, 0, 0, 0))
         draw = ImageDraw.Draw(layer)
         _, fallback = font_file(item.get("font", "malgun.ttf"))
@@ -551,6 +634,7 @@ def render_scene(project, frame, warn=None, video_frames=None):
             y = top + 9 + index * (ascent + descent + spacing)
             draw.text((x, y), line, font=font, fill=item.get("color", "#ffffff"),
                       stroke_width=max(0, int(item.get("outline", 2))), stroke_fill="#000000")
+        if cache is not None: cache.put(key, layer)
         canvas = Image.alpha_composite(canvas, layer)
     return canvas.convert("RGB")
 
@@ -575,32 +659,101 @@ def concat_path(path):
     return str(Path(path).resolve()).replace("\\", "/").replace("'", "'\\''")
 
 
+def export_visuals(project, frame):
+    visible = active_visuals(project, frame)
+    # A stationary video is opaque; fully covered lower layers need no decoding.
+    for index in range(len(visible)-1, -1, -1):
+        cue = visible[index]
+        if "source_in_frame" not in cue or cue.get("motion"): continue
+        bounds = image_bounds(project, cue, frame)
+        if bounds and bounds[0] <= 0 and bounds[1] <= 0 and bounds[2] >= SIZE[0] and bounds[3] >= SIZE[1]:
+            return visible[index:]
+    return visible
+
+
+def export_spans(project, frames):
+    """Yield (start, end, repetitions) without caching decoded frames in RAM."""
+    boundaries = scene_boundaries(project, frames)
+    for begin, end in zip(boundaries, boundaries[1:]):
+        clips = export_visuals(project, begin)
+        videos = [c for c in clips if "source_in_frame" in c]
+        period = 1
+        reusable = bool(videos)
+        for cue in clips:
+            effect, length, _ = transition_info(project, cue)
+            if cue.get("motion") or (effect != "cut" and begin < cue["start"] + length):
+                reusable = False
+                break
+        if reusable:
+            for cue in videos:
+                period = math.lcm(period, cue["source_out_frame"] - cue["source_in_frame"])
+                if period > (end-begin)//2:
+                    reusable = False
+                    break
+        if not reusable:
+            yield begin, end, 1
+            continue
+        repeats, remaining = divmod(end-begin, period)
+        yield begin, begin+period, repeats
+        if remaining: yield end-remaining, end, 1
+
+
+class AudioMixer:
+    """Sweep the timeline and open only a bounded set of PCM source files."""
+    def __init__(self, clips, paths, max_open=8):
+        self.order = {id(clip): index for index, clip in enumerate(clips)}
+        self.clips = sorted(clips, key=audio_start)
+        self.paths, self.max_open = paths, max_open
+        self.streams = OrderedDict()
+        self.active, self.index, self.cursor = [], 0, -1
+
+    def __getitem__(self, ident):
+        if ident not in self.streams:
+            if len(self.streams) >= self.max_open:
+                self.streams.popitem(last=False)[1].close()
+            self.streams[ident] = Path(self.paths[ident]).open("rb")
+        self.streams.move_to_end(ident)
+        return self.streams[ident]
+
+    def read(self, cursor, count):
+        if cursor < self.cursor: self.active, self.index = [], 0
+        self.cursor = cursor
+        self.active = [c for c in self.active if audio_end(c) > cursor]
+        while self.index < len(self.clips) and audio_start(self.clips[self.index]) < cursor+count:
+            clip = self.clips[self.index]; self.index += 1
+            if audio_end(clip) > cursor: self.active.append(clip)
+        self.active.sort(key=lambda clip: self.order[id(clip)])
+        return mixed_audio_chunk(self.active, self, cursor, count)
+
+    def __enter__(self): return self
+
+    def __exit__(self, *error):
+        for stream in self.streams.values(): stream.close()
+        self.streams.clear()
+
+
 def assemble_audio(project, pcm_paths, destination, cancel):
     """Write a sample-accurate mix of every active clip in bounded chunks."""
-    from contextlib import ExitStack
     clips = timeline_audio(project)
     if any(not valid_audio(project, clip) for clip in clips):
         raise EditorError("음원 클립의 시간 범위가 올바르지 않습니다.")
-    with ExitStack() as stack:
-        streams = {}
+    assets = {a["id"]: a for a in project["audio_assets"]}
+    assets.update({"video:"+a["id"]: dict(a, samples=a["frames"]*(RATE//FPS))
+                   for a in project.get("video_assets", [])})
+    with AudioMixer(clips, pcm_paths) as mixer:
         for clip in clips:
-            asset = next((a for a in project["audio_assets"] if a["id"] == clip["asset"]), None)
-            if clip["asset"].startswith("video:"):
-                asset = next((dict(a, samples=a["frames"]*(RATE//FPS))
-                              for a in project.get("video_assets", []) if "video:"+a["id"] == clip["asset"]), None)
+            asset = assets.get(clip["asset"])
             if not asset: raise EditorError("음원 파일 참조를 찾지 못했습니다.")
             source = pcm_paths.get(clip["asset"])
             if not source or not Path(source).is_file():
                 raise EditorError("음원 분석 캐시가 없습니다. 음원을 다시 분석하세요.")
             if clip["source_out"] > asset["samples"]:
                 raise EditorError("음원 사용 구간이 원본 길이를 넘습니다. 다시 분석하세요.")
-            if clip["asset"] not in streams:
-                streams[clip["asset"]] = stack.enter_context(Path(source).open("rb"))
         final = duration_samples(project)
         with Path(destination).open("wb") as out:
             for cursor in range(0, final, 16384):
                 if cancel.is_set(): raise EditorError("작업을 취소했습니다.")
-                out.write(mixed_audio_chunk(clips, streams, cursor, min(16384, final-cursor)))
+                out.write(mixer.read(cursor, min(16384, final-cursor)))
     return final
 
 
@@ -642,7 +795,9 @@ def mixed_audio_chunk(clips, streams, cursor, count):
         fade_in = min(max(0, int(clip.get("fade_in_samples", 0))), length)
         fade_out = min(max(0, int(clip.get("fade_out_samples", 0))), length)
         clip_gain = float(clip.get("gain", 1.0))
-        if fade_in or fade_out or clip_gain != 1:
+        fading = ((fade_in and begin-audio_start(clip) < fade_in)
+                  or (fade_out and end-audio_start(clip) > length-fade_out))
+        if fading or clip_gain != 1:
             samples = array("f")
             samples.frombytes(raw)
             for frame in range(end - begin):
@@ -676,6 +831,9 @@ def mixed_audio_chunk(clips, streams, cursor, count):
 def _run_encoder(command, cancel, progress=None, input_frames=None, output_time=None):
     """Read both FFmpeg pipes so a full pipe cannot stall cancellation."""
     if cancel.is_set(): raise EditorError("작업을 취소했습니다.")
+    # Bound decoder/filter and output-encoder buffers, including video import.
+    command = [command[0], "-threads", "2", "-filter_threads", "2",
+               *command[1:-1], "-threads", "2", command[-1]]
     if output_time is not None:
         command = [command[0], "-progress", "pipe:1", "-nostats", *command[1:]]
     p = subprocess.Popen(command, stdin=subprocess.PIPE if input_frames is not None else subprocess.DEVNULL,
@@ -733,6 +891,45 @@ def _run_encoder(command, cancel, progress=None, input_frames=None, output_time=
             if pipe and not pipe.closed: pipe.close()
 
 
+@contextmanager
+def export_scene_layers(project, begin, end, ffmpeg, cancel, scratch, video_frames, cache):
+    """Flatten dense video stacks losslessly, using at most two source decoders."""
+    pending = deque(export_visuals(project, begin))
+    background = None
+    temporary = []
+    ident = "render-" + uid()
+    try:
+        while sum("source_in_frame" in c for c in pending) + bool(background) > 2:
+            group = [background] if background else []
+            count = int(bool(background))
+            while pending:
+                video = "source_in_frame" in pending[0]
+                if video and count == 2: break
+                group.append(pending.popleft()); count += video
+            path = Path(scratch) / (ident + "-" + uid() + ".mkv")
+            temporary.append(path)
+            video_frames.close()
+            stage = dict(project, texts=[])
+            command = [ffmpeg, "-hide_banner", "-nostdin", "-y", "-f", "rawvideo",
+                       "-pixel_format", "rgb24", "-video_size", "1920x1080", "-framerate", "30",
+                       "-i", "pipe:0", "-c:v", "ffv1", "-level", "3", "-pix_fmt", "bgr0",
+                       "-frames:v", str(end-begin), "-an", str(path)]
+            _run_encoder(command, cancel,
+                         input_frames=(render_scene(stage, f, video_frames=video_frames, cache=cache, visuals=group)
+                                       for f in range(begin, end)))
+            video_frames.close()
+            if len(temporary) > 1: temporary.pop(0).unlink()
+            video_frames.assets[ident] = dict(id=ident, path=str(path), width=1920, height=1080,
+                                               frames=end-begin, video_stream=0)
+            background = video_defaults(ident, begin, end-begin)
+        yield ([background] if background else []) + list(pending)
+    finally:
+        if temporary:
+            video_frames.close()
+            video_frames.assets.pop(ident, None)
+            for path in temporary: path.unlink(missing_ok=True)
+
+
 def export_video(project, duration, output, ffmpeg, cancel, report=None, pcm_paths=None):
     """Encode static spans once and motion/transition spans as streamed frames."""
     output = Path(output).resolve()
@@ -755,38 +952,53 @@ def export_video(project, duration, output, ffmpeg, cancel, report=None, pcm_pat
         with tempfile.TemporaryDirectory(prefix="music_video_scenes_") as temporary, \
                 VideoFrameProvider(project["video_assets"] if "video_assets" in project else [], ffmpeg, cancel) as video_frames:
             scratch = Path(temporary)
+            cache = LayerCache()
             audio_path = scratch / "timeline.f32le"
             written = assemble_audio(project, pcm_paths, audio_path, cancel)
             if written != duration_samples(project): raise EditorError("음원 타임라인 길이가 일치하지 않습니다.")
             if report: report(5)
-            boundaries = scene_boundaries(project, frames)
-            manifest_lines = ["ffconcat version 1.0"]
-            for index, (begin, end) in enumerate(zip(boundaries, boundaries[1:])):
-                if cancel.is_set(): raise EditorError("작업을 취소했습니다.")
-                if begin == end: continue
-                count = end - begin
-                segment = scratch / f"segment_{index:06d}.mp4"
-                dynamic = any(dynamic_frame(project, frame) for frame in (begin, end-1))
-                if dynamic:
-                    command = [ffmpeg, "-hide_banner", "-nostdin", "-y", "-f", "rawvideo",
-                               "-pixel_format", "rgb24", "-video_size", "1920x1080", "-framerate", "30",
-                               "-i", "pipe:0", "-vf", "format=yuv420p", "-c:v", "libx264",
-                               "-preset", "medium", "-crf", "23", "-frames:v", str(count), "-an", str(segment)]
-                    _run_encoder(command, cancel, lambda n: report(5 + int(75*(begin+n)/frames)) if report else None,
-                                 (render_scene(project, f, video_frames=video_frames) for f in range(begin, end)))
-                else:
-                    image_path = scratch / f"scene_{index:06d}.png"
-                    render_scene(project, begin, video_frames=video_frames).save(image_path)
-                    command = [ffmpeg, "-hide_banner", "-nostdin", "-y", "-loop", "1", "-framerate", "30",
-                               "-i", str(image_path), "-vf", "format=yuv420p", "-c:v", "libx264",
-                               "-preset", "medium", "-tune", "stillimage", "-crf", "23", "-r", "30",
-                               "-frames:v", str(count), "-an", str(segment)]
-                    _run_encoder(command, cancel)
-                    image_path.unlink()
-                manifest_lines.append(f"file '{concat_path(segment)}'")
-                if report: report(5 + int(75 * end / frames))
             manifest = scratch / "scenes.ffconcat"
-            manifest.write_text("\n".join(manifest_lines) + "\n", encoding="utf-8")
+            manifest.write_text("ffconcat version 1.0\n", encoding="utf-8")
+            for index, (span_begin, span_end, repeats) in enumerate(export_spans(project, frames)):
+                if cancel.is_set(): raise EditorError("작업을 취소했습니다.")
+                if span_begin == span_end: continue
+                span_count = span_end-span_begin
+                dense = sum("source_in_frame" in c for c in export_visuals(project, span_begin)) > 2
+                step = MAX_COMPOSITE_FRAMES if dense else span_count
+                chunks = range(span_begin, span_end, step)
+                for chunk, begin in enumerate(chunks):
+                    if cancel.is_set(): raise EditorError("작업을 취소했습니다.")
+                    end = min(begin+step, span_end)
+                    count = end-begin
+                    segment = scratch / f"segment_{index:06d}_{chunk:06d}.mp4"
+                    dynamic = any(dynamic_frame(project, frame) for frame in (begin, end-1))
+                    if dynamic:
+                        command = [ffmpeg, "-hide_banner", "-nostdin", "-y", "-f", "rawvideo",
+                                   "-pixel_format", "rgb24", "-video_size", "1920x1080", "-framerate", "30",
+                                   "-i", "pipe:0", "-vf", "format=yuv420p", "-c:v", "libx264",
+                                   "-preset", "veryfast", "-crf", "23", "-frames:v", str(count), "-an", str(segment)]
+                        scene = dict(project, texts=[t for t in project["texts"] if t["start"] <= begin < t["end"]])
+                        with export_scene_layers(scene, begin, end, ffmpeg, cancel, scratch, video_frames, cache) as visuals:
+                            _run_encoder(command, cancel, lambda n: report(5 + int(75*(begin+n)/frames)) if report else None,
+                                         (render_scene(scene, f, video_frames=video_frames, cache=cache, visuals=visuals)
+                                          for f in range(begin, end)))
+                    else:
+                        image_path = scratch / f"scene_{index:06d}.png"
+                        render_scene(project, begin, video_frames=video_frames, cache=cache).save(image_path)
+                        command = [ffmpeg, "-hide_banner", "-nostdin", "-y", "-loop", "1", "-framerate", "30",
+                                   "-i", str(image_path), "-vf", "format=yuv420p", "-c:v", "libx264",
+                                   "-preset", "medium", "-tune", "stillimage", "-crf", "23", "-r", "30",
+                                   "-frames:v", str(count), "-an", str(segment)]
+                        _run_encoder(command, cancel)
+                        image_path.unlink()
+                with manifest.open("a", encoding="utf-8") as entries:
+                    for _ in range(repeats):
+                        for chunk in range(len(chunks)):
+                            if cancel.is_set(): raise EditorError("작업을 취소했습니다.")
+                            segment = scratch / f"segment_{index:06d}_{chunk:06d}.mp4"
+                            entries.write(f"file '{concat_path(segment)}'\n")
+                if report: report(5 + int(75 * (span_begin + span_count*repeats) / frames))
+            video_frames.close()
             command = [ffmpeg, "-hide_banner", "-nostdin", "-y", "-f", "concat", "-safe", "0",
                        "-i", str(manifest), "-f", "f32le", "-ar", "48000", "-ac", "2", "-i", str(audio_path),
                        "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-frames:v", str(frames),

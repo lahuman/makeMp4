@@ -23,6 +23,57 @@ import video_media
 
 
 class VideoTimingTests(unittest.TestCase):
+    def test_export_spans_preserve_offsets_partial_loops_and_scene_changes(self):
+        project = core.fresh()
+        clip = core.video_defaults("v", 3, 12)
+        clip.update(duration_frames=65, loop_offset_frame=7)
+        clip["end"] = core.video_end(clip)
+        project["videos"] = [clip]
+        self.assertEqual(list(core.export_spans(project, 68)),
+                         [(0,3,1), (3,15,5), (63,68,1)])
+        project["texts"] = [{"start":27, "end":51}]
+        self.assertEqual(list(core.export_spans(project, 68)),
+                         [(0,3,1), (3,15,2), (27,39,2), (51,68,1)])
+        clip["motion"] = True
+        self.assertEqual(list(core.export_spans(project, 68)),
+                         [(0,3,1), (3,27,1), (27,51,1), (51,68,1)])
+
+    def test_export_spans_require_all_layers_to_repeat_together(self):
+        project = core.fresh()
+        for length in (4,6):
+            clip = core.video_defaults(str(length), 0, length)
+            clip.update(duration_frames=50, end=50)
+            project["videos"].append(clip)
+        self.assertEqual(list(core.export_spans(project, 50)), [(0,12,4), (48,50,1)])
+        image = core.image_defaults("image", 0, 50)
+        project["images"] = [image]
+        image["motion"] = True
+        self.assertEqual(list(core.export_spans(project, 50)), [(0,50,1)])
+        image["motion"] = False
+        image["transition"] = {"type":"dissolve", "frames":24}
+        project["images"].insert(0, core.image_defaults("previous", -30, 0))
+        self.assertEqual(list(core.export_spans(project, 50)), [(0,24,1), (24,36,2), (48,50,1)])
+
+    def test_visible_resize_matches_full_resize_with_alpha_and_offscreen_placement(self):
+        image = Image.new("RGBA", (96,64))
+        image.putdata([(x*2,y*3,(x+y)%256,(x*5+y*3)%256) for y in range(64) for x in range(96)])
+        with patch.object(core, "SIZE", (320,180)):
+            for zoom, x, y in ((100,160,90),(137,71,133),(500,160,90),(500,-500,450),(100,-500,90)):
+                with self.subTest(zoom=zoom,x=x,y=y):
+                    cue = core.image_defaults("a",0,30)
+                    cue["from"] = dict(x=x,y=y,zoom=zoom)
+                    factor = min(320/image.width,180/image.height)*zoom/100
+                    width,height = round(image.width*factor),round(image.height*factor)
+                    reference = Image.new("RGBA",core.SIZE)
+                    reference.paste(image.resize((width,height),Image.Resampling.LANCZOS),
+                                    (round(x-width/2),round(y-height/2)))
+                    with patch.object(Image.Image,"resize",autospec=True,side_effect=Image.Image.resize) as resize:
+                        result = core.picture_layer(image,cue,0)
+                    self.assertTrue(all(call.args[1][0] <= 320 and call.args[1][1] <= 180
+                                        for call in resize.call_args_list))
+                    difference = ImageChops.difference(reference,result)
+                    self.assertLessEqual(max(ImageStat.Stat(difference).mean),1)
+
     def project(self):
         project = core.fresh()
         project["video_assets"] = [{"id": "v", "path": "missing.mp4", "frames": 600, "has_audio": True}]
@@ -273,6 +324,62 @@ class RealVideoTests(unittest.TestCase):
         samples = array("f"); samples.frombytes(audio)
         self.assertGreater(max(abs(v) for v in samples[30*unit*2:40*unit*2]),.01)
 
+    def test_reused_export_matches_uncached_frames_audio_and_text_boundaries(self):
+        project = self.project(start=3,count=12)
+        clip = project["videos"][0]
+        clip.update(source_in_frame=24,source_out_frame=36,duration_frames=77,
+                    loop_offset_frame=7,audio_enabled=True,fade_in_samples=4800,fade_out_samples=4800)
+        clip["end"] = core.video_end(clip)
+        second = core.video_defaults("v",3,6)
+        second.update(source_in_frame=26,source_out_frame=32,duration_frames=77,
+                      loop_offset_frame=2,end=80,order=1)
+        second["from"].update(x=1500,zoom=40)
+        project["videos"].append(second)
+        project["texts"] = [dict(id="t",start=27,end=51,text="LOOP",size=80,width=800,
+                                 x=960,y=400,color="#00ff00",background_alpha=255)]
+        paths = {"video:v":self.prepared["pcm"]}
+        output = self.work/"reused.mp4"
+        progress = []
+        with patch.object(core,"render_scene",wraps=core.render_scene) as renderer:
+            core.export_video(project,core.duration_seconds(project),output,self.ffmpeg,self.cancel,
+                              report=progress.append,pcm_paths=paths)
+        self.assertLess(renderer.call_count,50)
+        self.assertEqual(progress,sorted(progress)); self.assertEqual(progress[-1],100)
+        reference = self.work/"uncached.mp4"
+        def uncached(project, frames):
+            edges = core.scene_boundaries(project,frames)
+            return ((a,b,1) for a,b in zip(edges,edges[1:]))
+        with patch.object(core,"export_spans",side_effect=uncached):
+            core.export_video(project,core.duration_seconds(project),reference,self.ffmpeg,self.cancel,pcm_paths=paths)
+        pictures = []
+        audio = []
+        for path in (output, reference):
+            pictures.append(self.run_ff(["-i",str(path),"-vf","scale=96:54","-an","-f","rawvideo",
+                                         "-pix_fmt","rgb24","-fps_mode","passthrough","pipe:1"]))
+            audio.append(self.run_ff(["-i",str(path),"-vn","-ar","48000","-ac","2","-f","f32le","pipe:1"]))
+        self.assertEqual(audio[0],audio[1])
+        size = 96*54*3
+        self.assertEqual(len(pictures[0]),80*size)
+        self.assertEqual(len(pictures[1]),80*size)
+        for frame in range(80):
+            a,b = (Image.frombytes("RGB",(96,54),data[frame*size:(frame+1)*size]) for data in pictures)
+            self.assertLess(max(ImageStat.Stat(ImageChops.difference(a,b)).mean),3,frame)
+
+    def test_many_repeats_encode_one_cycle_and_cancel_before_mux(self):
+        project = self.project(count=12)
+        clip = project["videos"][0]
+        clip.update(duration_frames=1200,end=1200)
+        cancel = threading.Event()
+        output = self.work/"reuse-cancel.mp4"
+        def report(percent):
+            if percent >= 80: cancel.set()
+        with patch.object(core,"render_scene",wraps=core.render_scene) as renderer:
+            with self.assertRaisesRegex(core.EditorError,"취소"):
+                core.export_video(project,40,output,self.ffmpeg,cancel,report=report)
+        self.assertEqual(renderer.call_count,12)
+        self.assertFalse(output.exists())
+        self.assertEqual(list(self.work.glob(".reuse-cancel_*.tmp.mp4")),[])
+
     def test_portrait_rotation_vfr_and_delayed_audio(self):
         portrait = self.work/"portrait.mp4"
         self.run_ff(["-f","lavfi","-i","testsrc2=s=90x160:r=24:d=1","-c:v","libx264","-an",str(portrait)])
@@ -431,6 +538,38 @@ class RealVideoTests(unittest.TestCase):
                 self.assertEqual(errors,[])
             finally:
                 app._stop_audio(); app.audio_cancel.set(); app._dispose_videos()
+                for timer in root.tk.call("after","info"): root.tk.call("after","cancel",timer)
+                root.destroy()
+
+    def test_tk_idle_preview_releases_decoder_and_export_suspends_requests(self):
+        processes = []
+        original_open = video_media.VideoDecoder._open
+        def opened(decoder, number):
+            original_open(decoder,number)
+            processes.append(decoder.process)
+        with patch.dict(os.environ,LOCALAPPDATA=str(self.work/"ui-idle")), \
+                patch.object(video_media.VideoDecoder,"_open",autospec=True,side_effect=opened):
+            root = tk.Tk(); root.withdraw()
+            app = EditorApp(root); app._save_ui_settings = lambda: None
+            def settle(check):
+                deadline = time.monotonic()+10
+                while not check() and time.monotonic()<deadline:
+                    root.update(); time.sleep(.01)
+                self.assertTrue(check())
+            try:
+                root.deiconify(); root.update()
+                app.project = self.project(); app.video_cache["v"] = self.prepared
+                app._refresh()
+                settle(lambda: bool(processes) and app.video_preview_key == app.preview_requested)
+                settle(lambda: all(p.poll() is not None for p in processes))
+                count = len(processes)
+                app.exporting = True; app.seek(.5)
+                root.update()
+                self.assertEqual(len(processes),count)
+                app.exporting = False; app.render_preview()
+                settle(lambda: len(processes)>count and app.video_preview_key == app.preview_requested)
+            finally:
+                app.exporting = False; app._stop_audio(); app.audio_cancel.set(); app._dispose_videos()
                 for timer in root.tk.call("after","info"): root.tk.call("after","cancel",timer)
                 root.destroy()
 
