@@ -104,9 +104,15 @@ class EditorApp:
         self.warned_fonts = set()
         self.status = tk.StringVar(value="음악 파일을 선택하세요.")
         self.time_label = tk.StringVar(value="00:00.000 / 00:00.000")
+        self.audio_meter_var = tk.StringVar(value="피크 — dBFS")
+        self.video_size_var = tk.StringVar(value=next(iter(core.VIDEO_SIZES)))
+        self.video_format_var = tk.StringVar(value="16:9 · 30fps")
+        self.export_format_var = tk.StringVar()
         self.progress = tk.IntVar()
         self._build()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.root.bind("<Map>", self._on_export_owner_activate, add="+")
+        self.root.bind("<FocusIn>", self._on_export_owner_activate, add="+")
         self.root.bind("<Control-z>", lambda e: self._shortcut(e, self.undo_action))
         self.root.bind("<Control-y>", lambda e: self._shortcut(e, self.redo_action))
         self.root.bind("<Delete>", lambda e: self._shortcut(e, self.delete_selected))
@@ -306,8 +312,13 @@ class EditorApp:
         body.add(center, weight=5)
         preview_bar = ttk.Frame(center, style="Workspace.TFrame", padding=(18, 12)); preview_bar.pack(fill="x")
         ttk.Label(preview_bar, text="미리보기", style="PreviewTitle.TLabel").pack(side="left")
+        self.video_size_combo = ttk.Combobox(preview_bar, textvariable=self.video_size_var,
+                                             values=list(core.VIDEO_SIZES), state="readonly", width=22)
+        self.video_size_combo.pack(side="left", padx=10)
+        self.video_size_combo.bind("<<ComboboxSelected>>", self._change_video_size)
         self.preview_context = ttk.Label(preview_bar, style="PreviewMuted.TLabel")
         self.preview_context.pack(side="right")
+        ttk.Label(preview_bar, textvariable=self.audio_meter_var, style="PreviewMuted.TLabel").pack(side="right", padx=8)
         self.preview = tk.Canvas(center, bg=UI_COLORS["preview"], highlightthickness=0)
         self.preview.pack(fill="both", expand=True, padx=18, pady=(0, 6))
         self.preview.bind("<Configure>", lambda e: self.render_preview())
@@ -328,7 +339,7 @@ class EditorApp:
         time_display = ttk.Button(transport, textvariable=self.time_label, style="Time.TButton",
                                   command=self._prompt_time, cursor="hand2")
         time_display.grid(row=0, column=0, sticky="w")
-        ttk.Label(transport, text="16:9 · 30fps", style="PreviewMuted.TLabel").grid(row=0, column=2, sticky="e")
+        ttk.Label(transport, textvariable=self.video_format_var, style="PreviewMuted.TLabel").grid(row=0, column=2, sticky="e")
         ttk.Label(center, text="사진을 끌어 위치 조절 · 모서리에서 크기 조절", style="PreviewMuted.TLabel").pack(
             anchor="w", padx=18, pady=(0, 14))
         self.right = ttk.Frame(body, width=290, style="Panel.TFrame")
@@ -530,10 +541,13 @@ class EditorApp:
                     ("저장", self.save_project), ("다른 이름으로 저장", self.save_as),
                     ("음악 가져오기", self.choose_audio), ("이미지 가져오기", self.add_assets),
                     *((("영상 가져오기", self.choose_video),) if hasattr(self, "choose_video") else ()),
-                    ("MP4 내보내기", self.start_export))),
+                    ("MP4 내보내기", self.start_export),
+                    *((("진단 정보", self.show_diagnostics),) if hasattr(self, "show_diagnostics") else ()))),
             ("편집", (("실행 취소", self.undo_action), ("다시 실행", self.redo_action),
                     *((("복사", self.copy_selected), ("붙여넣기", self.paste_clip))
                       if hasattr(self, "copy_selected") else ()),
+                    *((("재생 위치에서 분할", self.split_selected), ("전체 빈 구간 닫기", self.close_gap))
+                      if hasattr(self, "split_selected") else ()),
                     ("복제", self.duplicate_selected), ("삭제", self.delete_selected))),
             ("보기", (("프로젝트 패널", lambda: self.toggle_panel("left")),
                     ("속성 패널", lambda: self.toggle_panel("right")),
@@ -542,7 +556,7 @@ class EditorApp:
                           activebackground=UI_COLORS["primary_tint"], activeforeground=UI_COLORS["text"])
             for label, action in entries:
                 sub.add_command(label=label, command=action,
-                                accelerator={"복사": "Ctrl+C", "붙여넣기": "Ctrl+V"}.get(label, ""))
+                                accelerator={"복사": "Ctrl+C", "붙여넣기": "Ctrl+V", "재생 위치에서 분할": "S"}.get(label, ""))
             ttk.Menubutton(parent, text=title, menu=sub, style="Chrome.TMenubutton").pack(side="left", padx=(0, 4))
 
     def toggle_panel(self, side):
@@ -844,8 +858,9 @@ class EditorApp:
         start = frame_of(self.position, self.duration)
         end = min(core.total_frames(self.duration), start + 3 * core.FPS)
         if end <= start: start = max(0, end - 1)
+        width, height = core.project_size(self.project)
         item = {"id": core.uid(), "start": start, "end": end, "text": "텍스트",
-                "x": 960, "y": 840, "width": 1200, "size": 64, "font": "malgun.ttf",
+                "x": width//2, "y": round(height*7/9), "width": round(width*5/8), "size": 64, "font": "malgun.ttf",
                 "color": "#ffffff", "background": "#000000", "background_alpha": 160,
                 "outline": 2, "align": "center",
                 "order": max((t.get("order", 0) for t in self.project["texts"]), default=0) + 1}
@@ -903,7 +918,13 @@ class EditorApp:
             self._load_audio(self.project["audio"])
 
     def _show_properties(self):
-        self._populate_properties()
+        if getattr(self, "_building_properties", False): return
+        self._building_properties = True
+        self.property_entries = {}
+        try:
+            self._populate_properties()
+        finally:
+            self._building_properties = False
         # An offscreen canvas window may not receive Configure after its contents shrink.
         self.root.after_idle(self._resize_property_content)
 
@@ -920,7 +941,8 @@ class EditorApp:
                     return
             ttk.Label(self.properties, text="타임라인에서 클립을 선택하세요.", wraplength=250,
                       style="Muted.TLabel").pack(anchor="w", pady=8)
-            ttk.Label(self.properties, text="영상 1920×1080 · 30fps", style="Muted.TLabel").pack(anchor="w")
+            width, height = core.project_size(self.project)
+            ttk.Label(self.properties, text=f"영상 {width}×{height} · 30fps", style="Muted.TLabel").pack(anchor="w")
             return
         kind = self.selection[0]
         if kind == "image":
@@ -968,7 +990,8 @@ class EditorApp:
     def _build_position_props(self, box, item):
         for label, key in (("가로 중심 (px)", "x"), ("위쪽 위치 (px)", "y"), ("줄바꿈 폭 (px)", "width")):
             self._prop_entry(label, str(item[key]), key, box)
-        ttk.Label(box, text="좌표 기준: 1920×1080", style="Muted.TLabel").pack(anchor="w", pady=4)
+        width, height = core.project_size(self.project)
+        ttk.Label(box, text=f"좌표 기준: {width}×{height}", style="Muted.TLabel").pack(anchor="w", pady=4)
         ttk.Label(box, text="정렬").pack(anchor="w")
         names = {"left": "왼쪽", "center": "가운데", "right": "오른쪽"}
         align = ttk.Combobox(box, values=list(names.values()), state="readonly")
@@ -1014,9 +1037,12 @@ class EditorApp:
         ttk.Label(row, text=label, style="Muted.TLabel", wraplength=145).grid(row=0, column=0, sticky="w", padx=(0, 8))
         var = tk.StringVar(value=value)
         entry = ttk.Entry(row, textvariable=var, width=10, justify="right"); entry.grid(row=0, column=1, sticky="e")
+        entry._property_var = var
+        entry._property_value = str(value)
+        self.property_entries[key] = entry
         selected_id = self.selection[1] if self.selection else None
-        entry.bind("<Return>", lambda e: self._commit(key, var.get(), selected_id))
-        entry.bind("<FocusOut>", lambda e: self._commit(key, var.get(), selected_id))
+        entry.bind("<Return>", lambda e: self._commit_property_entry(entry, key, selected_id))
+        entry.bind("<FocusOut>", lambda e: self._commit_property_entry(entry, key, selected_id))
 
     def _prop_fields(self, fields, parent=None):
         row = ttk.Frame(parent or self.properties)
@@ -1030,9 +1056,17 @@ class EditorApp:
             entry = ttk.Entry(field, width=6)
             entry.insert(0, value)
             entry.pack(fill="x")
-            commit = lambda e, widget=entry, name=key: self._commit(name, widget.get(), selected_id)
+            entry._property_value = str(value)
+            self.property_entries[key] = entry
+            commit = lambda e, widget=entry, name=key: self._commit_property_entry(widget, name, selected_id)
             entry.bind("<Return>", commit)
             entry.bind("<FocusOut>", commit)
+
+    def _commit_property_entry(self, entry, key, selected_id):
+        if getattr(self, "_building_properties", False) or not entry.winfo_exists(): return
+        value = entry.get()
+        if value != entry._property_value:
+            self._commit(key, value, selected_id)
 
     def _choose_color(self, key):
         item = self._selected()
@@ -1058,7 +1092,8 @@ class EditorApp:
                 key = field
             elif key in ("x", "y", "size", "width", "background_alpha", "outline", "order"):
                 value = int(float(raw))
-                limits = {"x": (0,1920), "y": (0,1080), "size":(8,240), "width":(80,1900),
+                width, height = core.project_size(self.project)
+                limits = {"x": (0,width), "y": (0,height), "size":(8,240), "width":(80,width-20),
                           "background_alpha":(0,255), "outline":(0,20), "order":(0,10000)}
                 value = max(limits[key][0], min(limits[key][1], value))
             else: value = raw
@@ -1073,12 +1108,36 @@ class EditorApp:
             self.warned_fonts.add(name)
             self.status.set(f"글꼴 {name}을 찾지 못해 대체 글꼴을 사용합니다.")
 
+    def _refresh_video_format(self):
+        size = core.project_size(self.project)
+        label = next(label for label, value in core.VIDEO_SIZES.items() if value == size)
+        self.video_size_var.set(label)
+        self.video_format_var.set(label.split(" · ")[0] + " · 30fps")
+        self.export_format_var.set(f"{clock(self.duration)}  ·  {size[0]}×{size[1]}  ·  30fps  ·  H.264 / AAC")
+        self.video_size_combo.configure(state="disabled" if self.exporting else "readonly")
+
+    def _change_video_size(self, event=None):
+        size = core.VIDEO_SIZES.get(self.video_size_var.get())
+        if size is None or not self._editable() or size == core.project_size(self.project):
+            self._refresh_video_format(); return
+        if hasattr(self, "_commit_text_draft"): self._commit_text_draft()
+        self._stop_audio()
+        self._change()
+        core.set_project_size(self.project, size)
+        self.preview_drag = None
+        self.scene_cache_key = None
+        self.preview_ref = None
+        self._refresh()
+        self.status.set(f"화면을 {self.video_size_var.get()}으로 변경했습니다. 이미지·문구 배치를 확인하세요.")
+
     def render_preview(self):
+        self._refresh_video_format()
         if not self.preview.winfo_exists(): return
         w, h = self.preview.winfo_width(), self.preview.winfo_height()
         if w < 20 or h < 20: return
-        scale = min(w / 1920, h / 1080)
-        width, height = max(1, int(1920 * scale)), max(1, int(1080 * scale))
+        output_width, output_height = core.project_size(self.project)
+        scale = min(w / output_width, h / output_height)
+        width, height = max(1, int(output_width * scale)), max(1, int(output_height * scale))
         x, y = (w-width)//2, (h-height)//2
         try:
             frame = min(core.total_frames(self.duration)-1, round(self.position * core.FPS))
@@ -1097,7 +1156,7 @@ class EditorApp:
                                          fill="#afb5bf", font=("Malgun Gothic", 13))
             item = self._selected()
             if item and self.selection[0] == "text" and item["start"] <= frame < item["end"]:
-                l, t, r, b = core.text_box(item)
+                l, t, r, b = core.text_box(item, core.project_size(self.project))
                 self.preview.create_rectangle(x+l*scale, y+t*scale, x+r*scale, y+b*scale,
                                               outline="#00d6ff", width=2)
         except core.EditorError as e:
@@ -1106,11 +1165,12 @@ class EditorApp:
     def _preview_hit(self, px, py):
         x, y, w, h = self.preview_rect
         if not (x <= px <= x+w and y <= py <= y+h): return None
-        fx, fy = (px-x)*1920/w, (py-y)*1080/h
+        output_width, output_height = core.project_size(self.project)
+        fx, fy = (px-x)*output_width/w, (py-y)*output_height/h
         frame = min(core.total_frames(self.duration)-1, round(self.position*core.FPS))
         for t in sorted(self.project["texts"], key=lambda t: t.get("order",0), reverse=True):
             if not t["start"] <= frame < t["end"]: continue
-            l, top, r, bottom = core.text_box(t)
+            l, top, r, bottom = core.text_box(t, core.project_size(self.project))
             if l <= fx <= r and top <= fy <= bottom:
                 return t
         return None
@@ -1134,8 +1194,9 @@ class EditorApp:
         if not recorded:
             self._change(); recorded = True
         _, _, w, h = self.preview_rect
-        item["x"] = max(0, min(1920, round(ox+(e.x-sx)*1920/w)))
-        item["y"] = max(0, min(1080, round(oy+(e.y-sy)*1080/h)))
+        output_width, output_height = core.project_size(self.project)
+        item["x"] = max(0, min(output_width, round(ox+(e.x-sx)*output_width/w)))
+        item["y"] = max(0, min(output_height, round(oy+(e.y-sy)*output_height/h)))
         self.scene_cache_key = None
         self.preview_drag = (sx, sy, ox, oy, recorded)
         self.render_preview()
@@ -1238,20 +1299,17 @@ class EditorApp:
                 label_x = x0+6
                 if asset and x1-x0 > 85:
                     try:
-                        from PIL import Image, ImageOps
                         path = Path(asset["path"])
                         key = (str(path), path.stat().st_mtime_ns)
                         thumb = self.timeline_thumbnail_cache.get(key)
                         if thumb is None:
-                            with Image.open(path) as source:
-                                frame_image = ImageOps.exif_transpose(source).convert("RGB")
-                                frame_image.thumbnail((48, 34))
-                                thumb = ImageTk.PhotoImage(frame_image, master=self.root)
+                            frame_image = core.thumbnail_image(path, (48, 34), "RGB")
+                            thumb = ImageTk.PhotoImage(frame_image, master=self.root)
                             if len(self.timeline_thumbnail_cache)>180: self.timeline_thumbnail_cache.clear()
                             self.timeline_thumbnail_cache[key] = thumb
                         c.create_image(x0+5,image_y+29,anchor="w",image=thumb,tags=("image",cue["id"]))
                         label_x = x0+57
-                    except OSError: pass
+                    except (OSError, ValueError, core.EditorError): pass
                 chars = max(1, int((x1-label_x-6)/7))
                 c.create_text(label_x,image_y+29,anchor="w",text=name[:chars-1]+"…" if len(name)>chars else name,
                               fill="white",tags=("image",cue["id"]))
@@ -1415,6 +1473,7 @@ class EditorApp:
             self.play_stop.set()
             self.playing=False
             self._set_play_button(False)
+        self.audio_meter_var.set("피크 — dBFS")
 
     def _tick(self):
         if self.playing:
@@ -1424,6 +1483,7 @@ class EditorApp:
         self.root.after(80,self._tick)
 
     def _show_job_controls(self, running=False, complete=False):
+        self._refresh_video_format()
         if running:
             if not self.progressbar.winfo_manager(): self.progressbar.pack(side="left")
             if not self.cancel_button.winfo_manager(): self.cancel_button.pack(side="right")
@@ -1435,19 +1495,45 @@ class EditorApp:
         else:
             self.open_file.pack_forget(); self.open_folder.pack_forget()
 
+    def _activate_export_dialog(self):
+        dialog = self.export_dialog
+        if not dialog or not dialog.winfo_exists(): return False
+        if self.root.state() in ("iconic", "withdrawn"): return True
+        if dialog.state() in ("iconic", "withdrawn"): dialog.deiconify()
+        dialog.lift()
+        (dialog.focus_lastfor() or dialog).focus_set()
+        return True
+
+    def _on_export_owner_activate(self, event):
+        if event.widget is self.root and self.root.state() not in ("iconic", "withdrawn"):
+            # Restore after the window manager has remapped owned windows.
+            self.root.after_idle(self._activate_export_dialog)
+
+    def _on_export_dialog_visibility(self, event):
+        dialog = self.export_dialog
+        if event.widget is not dialog or not dialog.winfo_exists(): return
+        if event.type == tk.EventType.Map:
+            dialog.grab_set()
+        elif dialog.grab_current() is dialog:
+            # A hidden modal window must not keep the editor's input grab.
+            dialog.grab_release()
+        if event.type == tk.EventType.Unmap and dialog.state() == "iconic":
+            self.root.iconify()
+
     def start_export(self):
+        if self._activate_export_dialog(): return
         if self.exporting or not self.duration:
             messagebox.showwarning("내보내기", "먼저 음악을 선택하고 분석이 끝날 때까지 기다리세요."); return
         if not self.project["images"] and not self.project.get("videos"):
             if not messagebox.askyesno("검은 화면", "이미지가 없습니다. 검은 화면과 텍스트로 영상을 만들까요?"): return
-        if self.export_dialog and self.export_dialog.winfo_exists():
-            self.export_dialog.lift(); return
         dialog = tk.Toplevel(self.root)
         dialog.title("MP4 내보내기")
         dialog.configure(bg=UI_COLORS["surface"])
         dialog.resizable(False, False)
         dialog.transient(self.root)
         self.export_dialog = dialog
+        dialog.bind("<Map>", self._on_export_dialog_visibility)
+        dialog.bind("<Unmap>", self._on_export_dialog_visibility)
         body = ttk.Frame(dialog, style="Panel.TFrame", padding=18)
         body.pack(fill="both", expand=True)
         self.export_heading = ttk.Label(body, text="MP4 내보내기", style="PanelTitle.TLabel")
@@ -1457,16 +1543,38 @@ class EditorApp:
             default_folder = Path(self.last_export_folder)
         self.export_folder_var = tk.StringVar(value=str(default_folder))
         self.export_name_var = tk.StringVar(value=(self.project_file.stem if self.project_file else "음악 영상") + ".mp4")
+        self.export_name_var.trace_add("write", self._filter_export_name)
+        self._filter_export_name()
         self.export_form = ttk.Frame(body, style="Panel.TFrame")
         self.export_form.pack(fill="x")
         ttk.Label(self.export_form, text="파일 이름").pack(anchor="w")
         name_entry = ttk.Entry(self.export_form, textvariable=self.export_name_var, width=48)
-        name_entry.pack(fill="x", pady=(3, 9))
+        name_entry.pack(fill="x", pady=(3, 3))
+        ttk.Label(self.export_form, text='사용할 수 없는 문자 < > : " / \\ | ? * 는 자동으로 제거됩니다.',
+                  style="Muted.TLabel").pack(anchor="w", pady=(0, 9))
         ttk.Label(self.export_form, text="저장 폴더").pack(anchor="w")
         folder_row = ttk.Frame(self.export_form, style="Panel.TFrame"); folder_row.pack(fill="x", pady=(3, 10))
         ttk.Entry(folder_row, textvariable=self.export_folder_var).pack(side="left", fill="x", expand=True)
         ttk.Button(folder_row, text="찾기…", command=self._browse_export_folder).pack(side="right", padx=(6, 0))
-        ttk.Label(self.export_form, text=f"{clock(self.duration)}  ·  1920×1080  ·  30fps  ·  H.264 / AAC",
+        ttk.Label(self.export_form, text="출력 품질").pack(anchor="w")
+        self.export_quality_var = tk.StringVar(value=core.DEFAULT_EXPORT_QUALITY)
+        ttk.Combobox(self.export_form, textvariable=self.export_quality_var,
+                     values=tuple(core.EXPORT_QUALITIES), state="readonly").pack(fill="x", pady=(3, 6))
+        ttk.Label(self.export_form, text="품질을 높이면 처리 시간과 파일 크기가 늘어날 수 있습니다.",
+                  style="Muted.TLabel").pack(anchor="w", pady=(0, 6))
+        ttk.Label(self.export_form, text="인코딩 방식").pack(anchor="w")
+        self.export_acceleration_var = tk.StringVar(value="CPU (품질 우선)")
+        ttk.Combobox(self.export_form, textvariable=self.export_acceleration_var,
+                     values=tuple(core.EXPORT_ACCELERATIONS), state="readonly").pack(fill="x", pady=(3, 6))
+        ttk.Label(self.export_form, text="GPU는 지원 여부를 검사하며, 실패하면 CPU로 다시 출력합니다.",
+                  style="Muted.TLabel").pack(anchor="w", pady=(0, 6))
+        ttk.Label(self.export_form, text="출력 소리").pack(anchor="w")
+        self.export_audio_var = tk.StringVar(value="피크 보호 (권장)")
+        ttk.Combobox(self.export_form, textvariable=self.export_audio_var,
+                     values=tuple(core.EXPORT_AUDIO_MODES), state="readonly").pack(fill="x", pady=(3, 3))
+        ttk.Label(self.export_form, text="피크 보호 -2 dB · 정규화 -16 LUFS / -2 dBTP",
+                  style="Muted.TLabel").pack(anchor="w", pady=(0, 6))
+        ttk.Label(self.export_form, textvariable=self.export_format_var,
                   style="Muted.TLabel").pack(anchor="w", pady=(2, 12))
         self.export_result_frame = ttk.Frame(body, style="Result.TFrame", padding=12)
         self.export_result_name = ttk.Label(self.export_result_frame, style="ResultTitle.TLabel", wraplength=320)
@@ -1520,8 +1628,12 @@ class EditorApp:
         self.export_form.pack_forget()
         self.export_dialog_progress.pack_forget()
         self.export_result_name.configure(text=result.name)
+        width, height = getattr(self, "export_size", core.project_size(self.project))
         self.export_result_details.configure(
-            text=f"길이 {clock(self.duration)}  ·  파일 크기 {size / 1048576:.1f} MB\n1920×1080  ·  30fps")
+            text=f"길이 {clock(self.duration)}  ·  파일 크기 {size / 1048576:.1f} MB\n{width}×{height}  ·  30fps"
+                 + ("\n"+self.export_encoder_status if getattr(self, "export_encoder_status", None) else ""))
+        if getattr(self, "export_audio_status", None):
+            self.export_result_details.configure(text=self.export_result_details.cget("text") + "\n" + self.export_audio_status)
         self.export_result_path.configure(text=str(result))
         self.export_result_frame.pack(fill="x", pady=(0, 10), before=self.export_status_label)
         self.export_status_label.configure(text="영상이 저장되었습니다.", style="Success.TLabel")
@@ -1537,11 +1649,23 @@ class EditorApp:
         self.root.clipboard_append(str(self.last_output))
         self.export_status_label.configure(text="저장 경로를 복사했습니다.")
 
+    def _filter_export_name(self, *_):
+        name = self.export_name_var.get()
+        filtered = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", name)
+        if name != filtered:
+            self.export_name_var.set(filtered)
+
     def _export_from_dialog(self):
-        name = self.export_name_var.get().strip()
+        self._filter_export_name()
+        name = self.export_name_var.get().strip().rstrip(". ")
         if not name or Path(name).name != name or name in (".", ".."):
             self.export_status_label.configure(text="파일 이름만 입력하세요."); return
         if not name.lower().endswith(".mp4"): name += ".mp4"
+        if not name[:-4].strip(". "):
+            self.export_status_label.configure(text="확장자 앞에 파일 이름을 입력하세요."); return
+        if re.fullmatch(r"CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³]", name.split(".")[0].rstrip(" "), re.IGNORECASE):
+            self.export_status_label.configure(text="Windows에서 예약한 파일 이름입니다. 다른 이름을 입력하세요."); return
+        self.export_name_var.set(name)
         path = str(Path(self.export_folder_var.get()) / name)
         if not Path(self.export_folder_var.get()).is_dir():
             self.export_status_label.configure(text="저장 폴더를 찾을 수 없습니다."); return
@@ -1567,10 +1691,18 @@ class EditorApp:
             self.export_start_button.configure(state="disabled")
             self.export_cancel_button.configure(text="작업 취소")
         snapshot=copy.deepcopy(self.project); duration=self.duration; cancel=self.export_cancel
+        self.export_size = core.project_size(snapshot)
+        quality = self.export_quality_var.get() if hasattr(self, "export_quality_var") else core.DEFAULT_EXPORT_QUALITY
+        acceleration = core.EXPORT_ACCELERATIONS[self.export_acceleration_var.get()] if hasattr(self, "export_acceleration_var") else "cpu"
+        audio_mode = core.EXPORT_AUDIO_MODES[self.export_audio_var.get()] if hasattr(self, "export_audio_var") else "original"
+        self.export_encoder_status = ""
+        self.export_audio_status = ""
         def worker():
             try:
                 result=core.export_video(snapshot,duration,path,ffmpeg,cancel,
-                                         lambda n:self.events.put(("progress",n)))
+                                         lambda n:self.events.put(("progress",n)), quality=quality, acceleration=acceleration,
+                                         on_encoder=lambda message:self.events.put(("encoder_status", message)), audio_mode=audio_mode,
+                                         on_audio=lambda message:self.events.put(("audio_status", message)))
                 self.events.put(("export_done",result))
             except Exception as e: self.events.put(("export_error",str(e)))
         self.export_thread = threading.Thread(target=worker,daemon=True)
@@ -1613,6 +1745,10 @@ class EditorApp:
                     self.progress.set(event[1]); self.status.set(f"MP4 내보내는 중… {event[1]}%")
                     if self.export_dialog and self.export_dialog.winfo_exists():
                         self.export_status_label.configure(text=f"MP4 만드는 중… {event[1]}%")
+                elif kind=="encoder_status":
+                    self.export_encoder_status = event[1]; self.status.set(event[1])
+                elif kind=="audio_status":
+                    self.export_audio_status = event[1]; self.status.set(event[1])
                 elif kind=="export_done":
                     self.exporting=False; self.last_output=event[1]; self.progress.set(100)
                     self.cancel_button.configure(state="disabled")

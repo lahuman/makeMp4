@@ -4,11 +4,13 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 import tkinter as tk
 from tkinter import ttk
 from types import SimpleNamespace
 import unittest
+import wave
 from unittest.mock import patch
 
 from PIL import Image
@@ -19,6 +21,184 @@ from editor_ui import UI_COLORS
 
 
 class InitialLayoutTests(unittest.TestCase):
+    def test_preview_image_drag_at_video_end_keeps_inspector_and_undo(self):
+        app = EditorApp(self.root)
+        path = Path(self.folder.name)/"drag.png"
+        Image.new("RGB",(90,160),"green").save(path)
+        core.set_project_size(app.project,(1080,1920))
+        app.project["audio_clips"] = [core.audio_defaults("a",0,core.RATE*3)]
+        app.project["assets"] = [dict(id="i",path=str(path))]
+        image = core.image_defaults("i",0,90,(1080,1920))
+        app.project["images"] = [image]
+        app.selection = ("image",image["id"])
+        app.property_groups["image_advanced"] = True
+        self.root.deiconify(); self.settle(); app._refresh()
+        app.seek(3)
+        x,y,w,h=app.preview_rect
+        widgets = tuple(app.properties.winfo_children())
+        before = copy.deepcopy(app.project)
+        undo_count = len(app.undo)
+        px,py = x+w//2,y+h//2
+        self.assertEqual(app._preview_target(px,py)[:2],("image",image))
+        with patch.object(app,"_populate_properties",wraps=app._populate_properties) as populate:
+            app.preview.event_generate("<ButtonPress-1>",x=px,y=py)
+            self.root.update()
+            for offset in (10,20,30):
+                app.preview.event_generate("<B1-Motion>",x=px+offset,y=py-10)
+                self.root.update()
+            app.preview.event_generate("<ButtonRelease-1>",x=px+30,y=py-10)
+            self.root.update()
+            self.assertEqual(populate.call_count,0)
+        self.assertEqual(tuple(app.properties.winfo_children()),widgets)
+        self.assertAlmostEqual(image["from"]["x"],540+30*1080/w)
+        self.assertAlmostEqual(image["from"]["y"],960-10*1920/h)
+        self.assertEqual(len(app.undo),undo_count+1)
+        app.undo_action()
+        self.assertEqual(app.project,before)
+        image = app.project["images"][0]
+        app.selection = ("image",image["id"])
+        app._show_properties()
+        widgets = tuple(app.properties.winfo_children())
+        l,t,r,b = core.image_bounds(app.project,image,89)
+        px,py = round(x+r*w/1080),round(y+b*h/1920)
+        with patch.object(app,"_populate_properties",wraps=app._populate_properties) as populate:
+            app.preview.event_generate("<ButtonPress-1>",x=px,y=py)
+            self.root.update()
+            app.preview.event_generate("<B1-Motion>",x=px-20,y=py-20)
+            self.root.update()
+            app.preview.event_generate("<ButtonRelease-1>",x=px-20,y=py-20)
+            self.root.update()
+            self.assertEqual(populate.call_count,0)
+        self.assertLess(image["from"]["zoom"],100)
+        self.assertEqual(tuple(app.properties.winfo_children()),widgets)
+        zoom = app.property_entries["image_zoom"]
+        self.assertAlmostEqual(float(zoom.get()),image["from"]["zoom"],delta=.005)
+        before_focus = copy.deepcopy(app.project)
+        undo_count = len(app.undo)
+        zoom.event_generate("<FocusOut>")
+        self.root.update()
+        self.assertEqual(app.project,before_focus)
+        self.assertEqual(len(app.undo),undo_count)
+        app.undo_action()
+        self.assertEqual(app.project,before)
+
+    def test_static_image_edits_ignore_inactive_motion_end_state(self):
+        app = EditorApp(self.root)
+        path = Path(self.folder.name)/"static.png"
+        Image.new("RGB",(160,90),"green").save(path)
+        app.project["audio_clips"] = [core.audio_defaults("a",0,core.RATE*3)]
+        app.project["assets"] = [dict(id="i",path=str(path))]
+        image = core.image_defaults("i",0,90)
+        app.project["images"] = [image]
+        app.selection = ("image",image["id"])
+        self.root.deiconify(); self.settle(); app._refresh()
+        app.motion_key.set("to")
+        app._commit("image_zoom","75",image["id"])
+        self.assertEqual(core.transform_at(image,0)["zoom"],75)
+        app.motion_key.set("to")
+        app._commit("image_x","700",image["id"])
+        self.assertEqual(core.transform_at(image,0)["x"],700)
+        app.motion_key.set("to")
+        app._image_preset("fit")
+        self.assertEqual(core.transform_at(image,0),dict(x=960,y=540,zoom=100))
+
+    def test_image_overlay_drag_refreshes_each_video_preview_request(self):
+        app = EditorApp(self.root)
+        path = Path(self.folder.name)/"overlay.png"
+        Image.new("RGB",(160,90),"green").save(path)
+        app.project["assets"] = [dict(id="i",path=str(path))]
+        app.project["video_assets"] = [dict(id="v",path="video.mp4",frames=90,width=160,height=90)]
+        app.project["videos"] = [core.video_defaults("v",0,90)]
+        image = core.image_defaults("i",0,90)
+        image["from"]["zoom"] = 50
+        app.project["images"] = [image]
+        app.selection = ("image",image["id"])
+        self.root.deiconify(); self.settle(); app._refresh()
+        with patch.object(app,"_request_video_preview") as request:
+            x,y,w,h=app.preview_rect
+            px,py=x+w//2,y+h//2
+            app._preview_down(SimpleNamespace(x=px,y=py))
+            request.reset_mock()
+            for offset in (10,20,30): app._preview_move(SimpleNamespace(x=px+offset,y=py))
+            keys = [call.args[0] for call in request.call_args_list]
+            self.assertEqual(len(set(keys)),3)
+            app._preview_up(SimpleNamespace(x=px+30,y=py))
+
+    def test_portrait_selector_preview_defaults_drag_and_undo(self):
+        app = EditorApp(self.root)
+        self.root.deiconify()
+        self.settle()
+        app.project["audio_clips"] = [core.audio_defaults("a",0,core.RATE*3)]
+        audio_path = Path(self.folder.name)/"music.wav"
+        with wave.open(str(audio_path), "wb") as stream:
+            stream.setparams((1, 2, core.RATE, 0, "NONE", "not compressed"))
+            stream.writeframes(b"\0\0" * core.RATE * 3)
+        app.project["audio_assets"] = [dict(id="a", path=str(audio_path), samples=core.RATE*3)]
+        path = Path(self.folder.name)/"portrait.png"
+        Image.new("RGB",(90,160),"green").save(path)
+        app.project["assets"] = [dict(id="i",path=str(path))]
+        app._refresh()
+        app.place_asset("i",0)
+        app.add_text(0)
+        before = copy.deepcopy(app.project)
+        app.video_size_combo.current(1)
+        app.video_size_combo.event_generate("<<ComboboxSelected>>")
+        self.settle()
+        self.assertEqual(core.project_size(app.project),(1080,1920))
+        self.assertTrue(app.dirty)
+        x,y,w,h = app.preview_rect
+        self.assertAlmostEqual(w/h,9/16,delta=.01)
+        self.assertEqual(app.video_format_var.get(),"9:16 · 30fps")
+        self.assertIn("1080×1920",app.export_format_var.get())
+        item = app._selected()
+        self.assertEqual((item["x"],item["width"]),(540,675))
+        l,t,r,b = core.text_box(item,(1080,1920))
+        px,py = round(x+item["x"]*w/1080), round(y+(t+b)/2*h/1920)
+        self.assertIs(app._preview_hit(px,py),item)
+        app._preview_down(SimpleNamespace(x=px,y=py))
+        app._preview_move(SimpleNamespace(x=px+20,y=py-20))
+        app._preview_up(SimpleNamespace(x=px+20,y=py-20))
+        self.assertAlmostEqual(app._selected()["x"],540+20*1080/w,delta=1)
+        app.undo_action()
+        app.undo_action()
+        self.assertEqual(app.project,before)
+        self.assertEqual(app.video_size_combo.current(),0)
+        app.redo_action()
+        self.assertEqual(app.video_size_combo.current(),1)
+        app.place_asset("i",0)
+        self.assertEqual(app._selected()["from"],dict(x=540,y=960,zoom=100))
+        app._image_preset("fill")
+        self.assertEqual(core.image_bounds(app.project,app._selected(),0),(0,0,1080,1920))
+        app.add_text(0)
+        self.assertEqual((app._selected()["x"],app._selected()["y"],app._selected()["width"]),(540,1493,675))
+        app._commit("y","1800",app._selected()["id"])
+        app._commit("width","1900",app._selected()["id"])
+        self.assertEqual((app._selected()["y"],app._selected()["width"]),(1800,1060))
+        project_file = Path(self.folder.name)/"portrait.json"
+        core.save_project(app.project,project_file)
+        with patch("editor_ui_v2.filedialog.askopenfilename",return_value=str(project_file)), \
+                patch.object(app,"_confirm_dirty",return_value=True), \
+                patch.object(app,"_recheck_audio"):
+            app.open_project()
+        self.assertEqual(app.video_size_combo.current(),1)
+        with patch.object(app,"_confirm_dirty",return_value=True): app.new_project()
+        self.assertEqual(app.video_size_combo.current(),0)
+
+    def test_resolution_selector_is_locked_during_export(self):
+        app = EditorApp(self.root)
+        with patch("editor_ui_v2.threading.Thread.start"):
+            app._begin_export(Path(self.folder.name)/"output.mp4")
+        self.assertTrue(app.exporting)
+        self.assertEqual(str(app.video_size_combo.cget("state")),"disabled")
+        app.video_size_var.set(list(core.VIDEO_SIZES)[1])
+        with patch("editor_ui.messagebox.showwarning"):
+            app._change_video_size()
+        self.assertEqual(core.project_size(app.project),(1920,1080))
+        self.assertEqual(app.video_size_combo.current(),0)
+        app.exporting = False
+        app.render_preview()
+        self.assertEqual(str(app.video_size_combo.cget("state")),"readonly")
+
     def setUp(self):
         work = Path(__file__).resolve().parents[1] / "build" / "layout-tests"
         work.mkdir(parents=True, exist_ok=True)
@@ -608,6 +788,137 @@ class InitialLayoutTests(unittest.TestCase):
         self.assertEqual(len(app.project["images"]), 2)
         app.undo_action()
         self.assertEqual(len(app.project["images"]), 1)
+
+    def test_hidden_export_dialog_reopens_with_form_and_focus(self):
+        app = EditorApp(self.root)
+        app.duration = 1
+        self.root.deiconify()
+        self.settle()
+        with patch("editor_ui.messagebox.askyesno", return_value=True):
+            app.start_export()
+        self.settle()
+        dialog = app.export_dialog
+        app.export_name_var.set("작성 중.mp4")
+        app.export_folder_var.set(self.folder.name)
+        entry = dialog.focus_lastfor()
+        entry.focus_force()
+        self.settle()
+        dialog.withdraw()
+        self.settle()
+        self.assertFalse(dialog.winfo_viewable())
+        self.assertIsNone(self.root.grab_current())
+        with patch("editor_ui.messagebox.askyesno") as prompt, \
+                patch("editor_ui.messagebox.showwarning") as warning:
+            app.start_export()
+        self.settle()
+        self.assertIs(app.export_dialog, dialog)
+        self.assertEqual(dialog.state(), "normal")
+        self.assertTrue(dialog.winfo_viewable())
+        self.assertIs(self.root.focus_get(), entry)
+        self.assertIs(self.root.grab_current(), dialog)
+        self.assertEqual(app.export_name_var.get(), "작성 중.mp4")
+        self.assertEqual(app.export_folder_var.get(), self.folder.name)
+        prompt.assert_not_called()
+        warning.assert_not_called()
+        app._close_export_dialog()
+        self.assertIsNone(self.root.grab_current())
+
+    @unittest.skipUnless(os.name == "nt", "Windows native minimize behavior")
+    def test_minimized_export_dialog_restores_on_owner_activation_during_export(self):
+        import ctypes
+
+        app = EditorApp(self.root)
+        app.duration = 1
+        self.root.deiconify()
+        self.settle()
+        with patch("editor_ui.messagebox.askyesno", return_value=True):
+            app.start_export()
+        self.settle()
+        dialog = app.export_dialog
+        dialog.focus_lastfor().focus_force()
+        self.settle()
+        with patch.object(app, "tool", return_value="ffmpeg"), \
+                patch("editor_ui_v2.threading.Thread.start"):
+            app._begin_export(Path(self.folder.name) / "output.mp4")
+        cancel = app.export_cancel
+        worker = app.export_thread
+        user32 = ctypes.windll.user32
+        user32.GetParent.argtypes = [ctypes.c_void_p]
+        user32.GetParent.restype = ctypes.c_void_p
+        user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+        hwnd = user32.GetParent(dialog.winfo_id())
+        owner = user32.GetParent(self.root.winfo_id())
+        def native_action(action):
+            native = threading.Thread(target=action)
+            native.start()
+            deadline = time.monotonic() + 3
+            while native.is_alive() and time.monotonic() < deadline:
+                self.settle(50)
+            self.assertFalse(native.is_alive())
+            self.settle()
+
+        native_action(lambda: user32.ShowWindow(hwnd, 6))
+        self.assertEqual(self.root.state(), "iconic")
+        self.assertFalse(dialog.winfo_viewable())
+        self.assertIsNone(self.root.grab_current())
+        native_action(lambda: (
+            user32.ShowWindow(owner, 9), user32.SetForegroundWindow(owner)))
+        self.assertEqual(dialog.state(), "normal")
+        self.assertTrue(dialog.winfo_viewable())
+        self.assertIs(self.root.focus_get().winfo_toplevel(), dialog)
+        self.assertIs(self.root.grab_current(), dialog)
+        self.assertIs(app.export_cancel, cancel)
+        self.assertIs(app.export_thread, worker)
+        self.assertFalse(cancel.is_set())
+        self.assertEqual(str(app.export_start_button.cget("state")), "disabled")
+        dialog.withdraw()
+        self.settle()
+        with patch("editor_ui.messagebox.showwarning") as warning:
+            app.start_export()
+        self.settle()
+        warning.assert_not_called()
+        self.assertTrue(dialog.winfo_viewable())
+        app.events.put(("progress", 42))
+        self.settle()
+        self.assertEqual(app.progress.get(), 42)
+        self.assertIn("42%", app.export_status_label.cget("text"))
+        app.export_cancel_button.invoke()
+        self.assertTrue(cancel.is_set())
+        app.exporting = False
+        app._close_export_dialog()
+
+    def test_export_completion_while_owner_minimized_restores_result_and_close(self):
+        app = EditorApp(self.root)
+        app.duration = 1
+        self.root.deiconify()
+        self.settle()
+        with patch("editor_ui.messagebox.askyesno", return_value=True):
+            app.start_export()
+        self.settle()
+        dialog = app.export_dialog
+        result = Path(self.folder.name) / "완료.mp4"
+        result.write_bytes(b"sample output")
+        app.exporting = True
+        self.root.iconify()
+        self.settle()
+        self.assertFalse(dialog.winfo_viewable())
+        app.events.put(("export_done", result))
+        self.settle()
+        self.assertFalse(app.exporting)
+        self.assertFalse(dialog.winfo_viewable())
+        self.root.deiconify()
+        self.settle()
+        self.assertIs(app.export_dialog, dialog)
+        self.assertTrue(dialog.winfo_viewable())
+        self.assertIs(self.root.focus_get().winfo_toplevel(), dialog)
+        self.assertIs(self.root.grab_current(), dialog)
+        self.assertEqual(app.export_heading.cget("text"), "MP4 생성 완료")
+        self.assertEqual(app.export_result_name.cget("text"), result.name)
+        self.assertTrue(app.export_result_button.winfo_viewable())
+        app.export_cancel_button.invoke()
+        self.assertIsNone(app.export_dialog)
+        self.assertIsNone(self.root.grab_current())
 
     def test_export_completion_shows_result_details_and_actions(self):
         app = EditorApp(self.root)

@@ -23,6 +23,40 @@ import video_media
 
 
 class VideoTimingTests(unittest.TestCase):
+    def test_resolution_roundtrip_scales_layout_and_preserves_timing(self):
+        project = core.fresh()
+        image = core.image_defaults("i", 3, 90)
+        project["assets"] = [dict(id="i", path="image.png")]
+        image["motion"] = True
+        image["to"].update(x=1440, y=810, zoom=150)
+        video = core.video_defaults("v", 6, 30)
+        project["images"] = [image]
+        project["video_assets"] = [dict(id="v", path="video.mp4", frames=30)]
+        project["videos"] = [video]
+        project["texts"] = [dict(id="t", start=3, end=30, x=960, y=840, width=1200, size=64, text="문구")]
+        core.set_project_size(project, (1080,1920))
+        self.assertEqual(core.project_size(project), (1080,1920))
+        self.assertEqual(image["from"], dict(x=540,y=960,zoom=100))
+        self.assertEqual(image["to"], dict(x=810,y=1440,zoom=150))
+        self.assertEqual(video["from"], dict(x=540,y=960,zoom=100))
+        self.assertEqual((project["texts"][0]["x"],project["texts"][0]["width"]), (540,675))
+        self.assertEqual((image["start"],image["end"],video["source_out_frame"]), (3,90,30))
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/"portrait.json"
+            core.save_project(project,path)
+            loaded = core.load_project(path)
+            self.assertEqual(core.project_size(loaded), (1080,1920))
+            self.assertEqual(loaded["texts"], project["texts"])
+        core.set_project_size(project,(1920,1080))
+        self.assertEqual(image["to"], dict(x=1440,y=810,zoom=150))
+
+    def test_legacy_resolution_defaults_and_invalid_settings(self):
+        self.assertEqual(core.project_size({}), (1920,1080))
+        for settings in (None, {"width":0}, {"width":"1080","height":1920},
+                         {"width":1080,"height":1919}):
+            with self.subTest(settings=settings), self.assertRaises(core.EditorError):
+                core.project_size({"settings":settings})
+
     def test_export_spans_preserve_offsets_partial_loops_and_scene_changes(self):
         project = core.fresh()
         clip = core.video_defaults("v", 3, 12)
@@ -167,6 +201,8 @@ class VideoTimingTests(unittest.TestCase):
             path.write_text(json.dumps(loaded), encoding="utf-8")
             with self.assertRaises(core.EditorError): core.load_project(path)
             project = core.fresh(); project["version"] = 2
+            project["audio_assets"] = [dict(id="a", path="music.wav", samples=1000)]
+            project["assets"] = [dict(id=ident, path=ident+".png") for ident in ("one", "two")]
             music = core.audio_defaults("a", 100, 1000); music["source_in"] = 300
             project["audio_clips"] = [music]
             project["images"] = [core.image_defaults("one",0,10), core.image_defaults("two",0,10)]
@@ -180,6 +216,79 @@ class VideoTimingTests(unittest.TestCase):
 
 
 class RealVideoTests(unittest.TestCase):
+    def test_portrait_static_export_with_transition_and_text(self):
+        project = core.fresh()
+        core.set_project_size(project,(1080,1920))
+        duration = .4
+        samples = round(duration*core.RATE)
+        pcm = self.work/"portrait.pcm"
+        pcm.write_bytes(bytes(samples*8))
+        project["audio_assets"] = [dict(id="a",path=str(self.source),samples=samples)]
+        project["audio_clips"] = [core.audio_defaults("a",0,samples)]
+        for ident,color in (("r","red"),("b","blue")):
+            path = self.work/f"portrait-{ident}.png"
+            Image.new("RGB",(90,160),color).save(path)
+            project["assets"].append(dict(id=ident,path=str(path)))
+        project["images"] = [core.image_defaults("r",0,6,(1080,1920)),
+                             core.image_defaults("b",6,12,(1080,1920))]
+        project["images"][1]["transition"] = dict(type="slide",frames=3)
+        project["texts"] = [dict(id="t",start=0,end=12,text="세로 영상",size=64,width=675,x=540,y=1500)]
+        cache = core.LayerCache()
+        still = core.render_scene(project,0,cache=cache)
+        self.assertEqual(still.size,(1080,1920))
+        self.assertEqual(core.image_bounds(project,project["images"][0],0),(0,0,1080,1920))
+        self.assertEqual(still.getpixel((540,960)),(255,0,0))
+        frame = core.render_scene(project,6,cache=cache)
+        self.assertEqual(frame.getpixel((900,960)),(0,0,255))
+        self.assertEqual(core.render_scene(project,10,cache=cache).getpixel((540,960)),(0,0,255))
+        output = self.work/"portrait-static.mp4"
+        core.export_video(project,duration,output,self.ffmpeg,self.cancel,pcm_paths={"a":pcm})
+        self.assert_portrait_output(output,12)
+
+    def test_portrait_dense_video_export_and_partial_loops(self):
+        project = self.project(count=6)
+        core.set_project_size(project,(1080,1920))
+        clip = project["videos"][0]
+        clip.update(duration_frames=15,end=15)
+        clip["motion"] = True
+        clip["to"]["x"] = 600
+        for ident in ("v2","v3"):
+            project["video_assets"].append(dict(project["video_assets"][0],id=ident))
+            layer = core.video_defaults(ident,0,6,(1080,1920))
+            layer.update(duration_frames=15,end=15)
+            project["videos"].append(layer)
+        output = self.work/"portrait-dense.mp4"
+        core.export_video(project,.5,output,self.ffmpeg,self.cancel)
+        self.assert_portrait_output(output,15)
+        raw = self.run_ff(["-i",str(output),"-vf","select=eq(n\\,14),scale=9:16",
+                           "-an","-f","rawvideo","-pix_fmt","rgb24","-fps_mode","passthrough","pipe:1"])
+        frame = Image.frombytes("RGB",(9,16),raw)
+        self.assertGreater(frame.getpixel((4,8))[0],220)
+        self.assertLess(max(frame.getpixel((4,0))),8)
+
+    def assert_portrait_output(self, output, frames):
+        result = subprocess.run([self.ffprobe,"-v","error","-show_streams","-of","json",str(output)],
+                                capture_output=True,check=True,creationflags=video_media.FLAGS)
+        streams = json.loads(result.stdout)["streams"]
+        video = next(s for s in streams if s["codec_type"]=="video")
+        self.assertEqual((video["width"],video["height"],video["pix_fmt"],video["r_frame_rate"],int(video["nb_frames"])),
+                         (1080,1920,"yuv420p","30/1",frames))
+        self.assertTrue(any(s["codec_name"]=="aac" for s in streams))
+
+    def test_portrait_source_keeps_full_hd_resolution(self):
+        source = self.work/"portrait-source.mp4"
+        self.run_ff(["-f","lavfi","-i","color=red:s=1080x1920:r=30:d=0.1",
+                     "-c:v","libx264","-pix_fmt","yuv420p",str(source)])
+        prepared = video_media.prepare_video(source,self.ffmpeg,self.ffprobe,self.cancel,self.work/"cache")
+        self.assertEqual((prepared["width"],prepared["height"]),(1080,1920))
+        project = core.fresh()
+        core.set_project_size(project,(1080,1920))
+        project["video_assets"] = [dict(prepared,id="p",path=str(source))]
+        project["videos"] = [core.video_defaults("p",0,3,(1080,1920))]
+        with video_media.VideoFrameProvider(project["video_assets"],self.ffmpeg,self.cancel) as provider:
+            scene = core.render_scene(project,0,video_frames=provider)
+            self.assertGreater(scene.getpixel((540,1910))[0],220)
+
     @classmethod
     def setUpClass(cls):
         cls.ffmpeg, cls.ffprobe = bundled_tool("ffmpeg"), bundled_tool("ffprobe")
@@ -571,6 +680,43 @@ class RealVideoTests(unittest.TestCase):
             finally:
                 app.exporting = False; app._stop_audio(); app.audio_cancel.set(); app._dispose_videos()
                 for timer in root.tk.call("after","info"): root.tk.call("after","cancel",timer)
+                root.destroy()
+
+    def test_tk_paused_backward_preview_reuses_frames_and_uncached_seek_reopens(self):
+        processes = []
+        original_open = video_media.VideoDecoder._open
+        def opened(decoder, number):
+            original_open(decoder, number)
+            processes.append(decoder.process)
+        with patch.dict(os.environ, LOCALAPPDATA=str(self.work/"ui-cached-seek")), \
+                patch.object(video_media.VideoDecoder, "_open", autospec=True, side_effect=opened):
+            root = tk.Tk(); root.withdraw()
+            app = EditorApp(root); app._save_ui_settings = lambda: None
+            def settle(check):
+                deadline = time.monotonic() + 10
+                while not check() and time.monotonic() < deadline:
+                    root.update(); time.sleep(.01)
+                self.assertTrue(check())
+            try:
+                root.deiconify(); root.update()
+                app.project = self.project(); app.video_cache["v"] = self.prepared
+                app.position = 1.0; app._refresh()
+                settle(lambda: bool(processes) and app.video_preview_key == app.preview_requested)
+                app.seek(31/core.FPS)
+                settle(lambda: app.video_preview_key == app.preview_requested)
+                settle(lambda: all(p.poll() is not None for p in processes))
+                count = len(processes)
+                app.seek(1.0)
+                settle(lambda: app.video_preview_key == app.preview_requested)
+                self.assertEqual(len(processes), count)
+                self.assertGreater(app.video_preview_picture.getpixel((960,540))[2], 230)
+                app.seek(0)
+                settle(lambda: app.video_preview_key == app.preview_requested)
+                self.assertGreater(len(processes), count)
+                self.assertGreater(app.video_preview_picture.getpixel((960,540))[0], 230)
+            finally:
+                app._stop_audio(); app.audio_cancel.set(); app._dispose_videos()
+                for timer in root.tk.call("after", "info"): root.tk.call("after", "cancel", timer)
                 root.destroy()
 
     def test_tk_video_import_trim_preview_playback_and_undo(self):

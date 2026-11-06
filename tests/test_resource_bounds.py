@@ -70,7 +70,7 @@ class ResourceBoundsTests(unittest.TestCase):
             project["assets"].append(dict(id=str(i),path=str(path)))
         cue = core.image_defaults("0",0,10)
         project["images"] = [cue]
-        with patch.object(core,"SIZE",(64,36)):
+        with patch.object(core,"project_size",return_value=(64,36)):
             cue["from"].update(x=32,y=18)
             cache = core.LayerCache(64*36*4*2)
             with patch.object(core.Image,"open",wraps=Image.open) as read:
@@ -209,7 +209,7 @@ class ImportQueueTests(unittest.TestCase):
                 return self.prepared() if kind=="video" else (str(self.pcm),array("f",[0]*100),core.RATE)
             finally: active[0] -= 1
         with patch.object(core,"probe_audio",return_value=1), \
-                patch.object(core,"analyze_audio_asset",side_effect=lambda *a: process("audio")), \
+                patch.object(core,"analyze_audio_asset",side_effect=lambda *a,**kw: process("audio")), \
                 patch.object(video_media,"prepare_video",side_effect=lambda *a,**kw: process("video")):
             for index in range(6):
                 self.add("audio",index); self.add("video",index)
@@ -272,7 +272,7 @@ class ImportQueueTests(unittest.TestCase):
                         raise core.EditorError("분석을 취소했습니다.")
                     return result
                 with patch.object(core,"probe_audio",return_value=1), \
-                        patch.object(core,"analyze_audio_asset",side_effect=lambda path,ffmpeg,cancel:
+                        patch.object(core,"analyze_audio_asset",side_effect=lambda path,ffmpeg,cancel,**kw:
                                      process(path,cancel,(str(self.pcm),array("f"),core.RATE))), \
                         patch.object(video_media,"prepare_video",side_effect=lambda path,ffmpeg,ffprobe,cancel,**kw:
                                      process(path,cancel,self.prepared())):

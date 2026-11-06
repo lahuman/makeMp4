@@ -19,9 +19,11 @@ import editor_core as core
 import video_media
 from editor_ui import EditorApp as BaseEditor, UI_COLORS, clock
 from studio_theme import rounded_clip
+from editor_session import ProjectSessionMixin
+import media_runtime as runtime
 
 
-class EditorApp(BaseEditor):
+class EditorApp(ProjectSessionMixin, BaseEditor):
     def __init__(self, root):
         self.audio_cache = {}
         self.video_cache = {}
@@ -67,12 +69,35 @@ class EditorApp(BaseEditor):
                                ("영상 모두 이어 붙이기", self.append_all_videos)):
             self.arrange_menu.add_command(label=label, command=command)
         self.arrange_button.configure(menu=self.arrange_menu)
+        self.clip_edit_button = ttk.Menubutton(self.timeline_bar, text="클립 편집")
+        self.clip_edit_button.pack(side="left", padx=4)
+        self.clip_edit_menu = tk.Menu(self.clip_edit_button, tearoff=False)
+        self.clip_edit_menu.add_command(label="재생 위치에서 분할", accelerator="S", command=self.split_selected)
+        self.clip_edit_menu.add_command(label="선택 클립 삭제", accelerator="Delete", command=self.delete_selected)
+        self.clip_edit_menu.add_separator()
+        self.clip_edit_menu.add_command(label="재생 위치의 전체 빈 구간 닫기", command=self.close_gap)
+        self.clip_edit_button.configure(menu=self.clip_edit_menu)
+        self.root.bind("<s>", lambda e: self._shortcut(e, self.split_selected))
+        self.root.bind("<S>", lambda e: self._shortcut(e, self.split_selected))
+        self.preview_actions = ttk.Frame(self.preview.master, style="Workspace.TFrame")
+        self.preview_actions.pack(fill="x", padx=18, pady=(0, 4), after=self.preview)
+        self.visual_action_buttons = []
+        for label, action in (("맞춤", lambda: self._image_preset("fit")),
+                              ("채움", lambda: self._image_preset("fill")),
+                              ("↻ 90°", lambda: self._orient_visual("rotation")),
+                              ("좌우 반전", lambda: self._orient_visual("flip_h")),
+                              ("상하 반전", lambda: self._orient_visual("flip_v"))):
+            button = ttk.Button(self.preview_actions, text=label, style="Quiet.TButton", command=action)
+            button.pack(side="left", padx=(0, 3)); self.visual_action_buttons.append(button)
         self.root.bind("<Control-c>", lambda e: self._shortcut(e, self.copy_selected))
         self.root.bind("<Control-v>", lambda e: self._shortcut(e, self.paste_clip))
         self.timeline_menu = tk.Menu(self.root, tearoff=False, bg=UI_COLORS["surface"],
                                      fg=UI_COLORS["text"], activebackground=UI_COLORS["primary_tint"])
         self.timeline_menu.add_command(label="복사", accelerator="Ctrl+C", command=self.copy_selected)
         self.timeline_menu.add_command(label="재생 위치에 붙여넣기", accelerator="Ctrl+V", command=self.paste_clip)
+        self.timeline_menu.add_separator()
+        self.timeline_menu.add_command(label="재생 위치에서 분할", accelerator="S", command=self.split_selected)
+        self.timeline_menu.add_command(label="재생 위치의 전체 빈 구간 닫기", command=self.close_gap)
         self.timeline.bind("<Button-3>", self._timeline_context)
         self.media_menu = tk.Menu(self.root, tearoff=False, bg=UI_COLORS["surface"],
                                   fg=UI_COLORS["text"], activebackground=UI_COLORS["primary_tint"])
@@ -86,6 +111,8 @@ class EditorApp(BaseEditor):
         self.root.bind("<FocusOut>", self._window_focus_out, add="+")
         self.status.set("음원과 이미지를 등록하세요. 목록에서 타임라인으로 끌어 놓을 수 있습니다.")
         self._refresh()
+
+        self._init_recovery()
 
     def _window_focus_out(self, event):
         if event.widget is self.root:
@@ -154,6 +181,8 @@ class EditorApp(BaseEditor):
             return super()._populate_properties()
         for child in self.properties.winfo_children(): child.destroy()
         kind = self.selection[0]
+        if kind == "image" and not item.get("motion"):
+            self.motion_key.set("from")
         if kind == "video":
             asset = next((a for a in self.project["video_assets"] if a["id"] == item["asset"]), None)
             ttk.Label(self.properties, text=Path(asset["path"]).name if asset else "영상 없음",
@@ -200,6 +229,11 @@ class EditorApp(BaseEditor):
             self._prop_entry("타임라인 시작 (초)", f"{item['start_sample']/core.RATE:.3f}", "start_seconds")
             self._prop_fields((("원본 시작 · 초", f"{item['source_in']/core.RATE:.3f}", "source_in_seconds"),
                                ("원본 끝 · 초", f"{item['source_out']/core.RATE:.3f}", "source_out_seconds")))
+            self._property_heading("음량")
+            self._prop_entry("음량 % (0~200)", str(round(item.get("gain", 1)*100)), "gain_percent")
+            muted = tk.BooleanVar(value=item.get("muted", False))
+            ttk.Checkbutton(self.properties, text="음소거", variable=muted,
+                            command=lambda: self._commit("audio_muted", muted.get(), item["id"])).pack(anchor="w", pady=4)
             self._property_heading("페이드")
             self._prop_fields((("페이드 인 · 초", f"{item.get('fade_in_samples', 0)/core.RATE:.3f}", "fade_in_seconds"),
                                ("페이드 아웃 · 초", f"{item.get('fade_out_samples', 0)/core.RATE:.3f}", "fade_out_seconds")))
@@ -214,7 +248,7 @@ class EditorApp(BaseEditor):
         self._prop_fields((("시작 · 초", f"{item['start']/core.FPS:.3f}", "start_seconds"),
                            ("끝 · 초", f"{item['end']/core.FPS:.3f}", "end_seconds")))
         self._property_heading("화면 배치")
-        state = item[self.motion_key.get()]
+        state = item[self._image_edit_key(item)]
         self._prop_entry("배율 %", str(round(state["zoom"])), "image_zoom")
         presets = ttk.Frame(self.properties, style="Panel.TFrame")
         presets.pack(fill="x")
@@ -238,7 +272,7 @@ class EditorApp(BaseEditor):
         self._property_group("image_advanced", "움직임과 레이어", lambda box: self._build_image_advanced(box, item))
 
     def _build_image_advanced(self, box, item):
-        state = item[self.motion_key.get()]
+        state = item[self._image_edit_key(item)]
         self._prop_fields((("가로 중심", str(round(state["x"])), "image_x"),
                            ("세로 중심", str(round(state["y"])), "image_y")), box)
         layer_actions = ttk.Frame(box); layer_actions.pack(fill="x", pady=(0, 8))
@@ -251,11 +285,12 @@ class EditorApp(BaseEditor):
                         command=lambda: self._commit("motion", motion.get(), item["id"])).pack(anchor="w", pady=8)
         ttk.Label(box, text="편집할 상태", style="Muted.TLabel").pack(anchor="w", pady=(0, 4))
         state_labels = {"from": "시작 상태", "to": "끝 상태"}
-        selected_state = tk.StringVar(value=state_labels[self.motion_key.get()])
-        combo = ttk.Combobox(box, values=tuple(state_labels.values()), textvariable=selected_state, state="readonly")
+        selected_state = tk.StringVar(value=state_labels[self._image_edit_key(item)])
+        combo = ttk.Combobox(box, values=tuple(state_labels.values()), textvariable=selected_state,
+                             state="readonly" if item.get("motion") else "disabled")
         combo.pack(fill="x")
-        combo.bind("<<ComboboxSelected>>", lambda e: (self.motion_key.set(
-            next(key for key, label in state_labels.items() if label == selected_state.get())), self._show_properties()))
+        combo.bind("<<ComboboxSelected>>", lambda e: self._select_image_state(
+            next(key for key, label in state_labels.items() if label == selected_state.get())))
         ttk.Label(box, text="움직임 속도", style="Muted.TLabel").pack(anchor="w", pady=(8, 4))
         easing_labels = {"smooth": "부드럽게", "linear": "일정하게"}
         ease = tk.StringVar(value=easing_labels[item.get("easing", "smooth")])
@@ -318,6 +353,7 @@ class EditorApp(BaseEditor):
                     elif key in ("fade_in_seconds", "fade_out_seconds"):
                         if value < 0: raise ValueError("페이드는 0초 이상입니다.")
                         trial[key.replace("seconds", "samples")] = round(value*core.RATE)
+                        trial.pop("envelope_length_samples", None); trial.pop("envelope_offset_samples", None)
                     elif key in ("image_x", "image_y", "image_zoom"):
                         trial["from"][key[6:]] = max(10, min(500, value)) if key == "image_zoom" else value
                         trial["to"] = dict(trial["from"])
@@ -326,13 +362,20 @@ class EditorApp(BaseEditor):
                 if not core.valid_video(self.project, trial): raise ValueError("원본 사용 구간과 타임라인 길이를 확인하세요.")
             elif kind == "audio":
                 asset = next(a for a in self.project["audio_assets"] if a["id"] == item["asset"])
-                value = round(float(raw) * core.RATE)
-                if key == "start_seconds": trial["start_sample"] = max(0, value)
+                number = float(raw)
+                if not math.isfinite(number): raise ValueError("유한한 숫자를 입력하세요.")
+                value = round(number * core.RATE)
+                if key == "gain_percent":
+                    if not 0 <= number <= 200: raise ValueError("음량은 0~200%입니다.")
+                    trial["gain"] = number/100
+                elif key == "audio_muted": trial["muted"] = bool(raw)
+                elif key == "start_seconds": trial["start_sample"] = max(0, value)
                 elif key == "source_in_seconds": trial["source_in"] = max(0, value)
                 elif key == "source_out_seconds": trial["source_out"] = min(asset.get("samples", 0), value)
                 elif key in ("fade_in_seconds", "fade_out_seconds"):
                     if value < 0: raise ValueError("페이드 시간은 0초 이상이어야 합니다.")
                     trial[key.replace("seconds", "samples")] = value
+                    trial.pop("envelope_length_samples", None); trial.pop("envelope_offset_samples", None)
                 else: return
                 if not core.valid_audio(self.project, trial, item["id"]): raise ValueError("음원 사용 구간이 잘못되었습니다.")
             else:
@@ -341,13 +384,20 @@ class EditorApp(BaseEditor):
                     if trial["end"] <= trial["start"]: raise ValueError("이미지 클립 길이는 0보다 커야 합니다.")
                 elif key in ("image_x", "image_y", "image_zoom"):
                     field = key[6:]
-                    trial[self.motion_key.get()][field] = max(10, min(500, float(raw))) if field == "zoom" else float(raw)
-                elif key == "transition_type": trial["transition"]["type"] = raw
-                elif key == "transition_seconds": trial["transition"]["frames"] = max(1, round(float(raw) * core.FPS))
+                    value = float(raw)
+                    if not math.isfinite(value): raise ValueError("유한한 숫자를 입력하세요.")
+                    trial[self._image_edit_key(item)][field] = max(10, min(500, value)) if field == "zoom" else value
+                elif key in ("transition_type", "transition_seconds"):
+                    trial["transition"].pop("source", None); trial["transition"].pop("offset_frames", None)
+                    if key == "transition_type": trial["transition"]["type"] = raw
+                    else: trial["transition"]["frames"] = max(1, round(float(raw) * core.FPS))
                 elif key in ("motion", "easing"): trial[key] = raw
                 else: return
             if trial != item:
-                self._change(); item.update(trial); self._refresh()
+                self._change(); item.update(trial)
+                if key in ("image_x", "image_y", "image_zoom"):
+                    self._refresh(False); self._sync_preview_properties()
+                else: self._refresh()
         except (ValueError, OverflowError, StopIteration) as e:
             messagebox.showerror("입력 오류", "시간과 겹침을 확인하세요.\n" + str(e))
 
@@ -361,13 +411,14 @@ class EditorApp(BaseEditor):
 
     def _image_preset(self, preset):
         item = self._selected()
-        if not item or self.selection[0] not in ("image", "video"): return
+        if not item or self.selection[0] not in ("image", "video") or not self._editable(): return
         trial = copy.deepcopy(item)
-        state = trial["from" if self.selection[0] == "video" else self.motion_key.get()]
+        output_width, output_height = core.project_size(self.project)
+        state = trial[self._image_edit_key(item)]
         if preset in ("fit", "reset"):
-            state.update(x=960, y=540, zoom=100)
+            state.update(x=output_width/2, y=output_height/2, zoom=100)
             trial.pop("legacy_native", None)
-        elif preset == "center": state.update(x=960, y=540)
+        elif preset == "center": state.update(x=output_width/2, y=output_height/2)
         else:
             if self.selection[0] == "video":
                 asset = next(a for a in self.project["video_assets"] if a["id"] == item["asset"])
@@ -376,15 +427,25 @@ class EditorApp(BaseEditor):
                 asset = next(a for a in self.project["assets"] if a["id"] == item["asset"])
                 with Image.open(asset["path"]) as source:
                     width, height = ImageOps.exif_transpose(source).size
-            ratio = max(core.SIZE[0] / width, core.SIZE[1] / height)
-            fit = min(core.SIZE[0] / width, core.SIZE[1] / height)
-            state.update(x=960, y=540, zoom=min(500, ratio / fit * 100))
+            if item.get("rotation", 0) % 180 == 90: width, height = height, width
+            ratio = max(output_width / width, output_height / height)
+            fit = min(output_width / width, output_height / height)
+            state.update(x=output_width/2, y=output_height/2, zoom=min(500, ratio / fit * 100))
             trial.pop("legacy_native", None)
         if preset == "reset":
             trial["from"] = dict(state); trial["to"] = dict(state); trial["motion"] = False
+            trial.update(rotation=0, flip_h=False, flip_v=False)
         if self.selection[0] == "video": trial["to"] = dict(trial["from"])
         if trial != item:
             self._change(); item.update(trial); self._refresh()
+
+    def _orient_visual(self, field):
+        self._commit_text_draft()
+        item = self._selected()
+        if not item or self.selection[0] not in ("image", "video") or not self._editable(): return
+        self._stop_audio(); self._change()
+        item[field] = (item.get(field, 0)+90) % 360 if field == "rotation" else not item.get(field, False)
+        self._refresh()
 
     def _move_image_layer(self, direction):
         item = self._selected()
@@ -402,10 +463,36 @@ class EditorApp(BaseEditor):
     def _image_wheel(self, event):
         item = self._selected()
         if not item or self.selection[0] not in ("image", "video"): return
-        key = "from" if self.selection[0] == "video" else self.motion_key.get()
+        key = self._image_edit_key(item)
         value = item[key]["zoom"] * (1.08 if event.delta > 0 else 1/1.08)
         self._commit("image_zoom", value, item["id"])
         return "break"
+
+    def _image_edit_key(self, item):
+        return "from" if "source_in_frame" in item or not item.get("motion") else self.motion_key.get()
+
+    def _select_image_state(self, key):
+        item = self._selected()
+        if not item or self.selection[0] != "image" or not self._editable(): return
+        self._stop_audio()
+        self.motion_key.set(key)
+        self.seek((item["start"] if key == "from" else item["end"]-1)/core.FPS)
+        self._show_properties()
+
+    def _sync_preview_properties(self):
+        item = self._selected()
+        if not item: return
+        if self.selection[0] in ("image", "video"):
+            state = item[self._image_edit_key(item)]
+            values = {"image_"+key: str(round(state[key], 2)) for key in ("x", "y", "zoom")}
+        else:
+            values = {key: str(item[key]) for key in ("x", "y", "width") if key in item}
+        for key, value in values.items():
+            entry = self.property_entries.get(key)
+            if entry is not None and entry.winfo_exists():
+                if entry.get() != value:
+                    entry.delete(0, "end"); entry.insert(0, value)
+                entry._property_value = value
 
     def _dispose_pcm(self):
         if self.play_thread and self.play_thread.is_alive():
@@ -451,6 +538,7 @@ class EditorApp(BaseEditor):
                     progress=lambda percent, stage: self.events.put(("video_progress", ident, token, percent, stage)))
                 self.events.put(("video_ready", ident, token, prepared))
             except Exception as e:
+                runtime.log_failure("video_import", e)
                 self.events.put(("video_error", ident, token, str(e)))
         self.media_executor.submit(worker)
 
@@ -464,6 +552,9 @@ class EditorApp(BaseEditor):
     def _video_metadata(asset, prepared):
         asset.update({key:prepared[key] for key in ("width","height","frames","video_stream","audio_stream",
                                                    "has_audio","rotation","video_start","audio_start")})
+        asset.update({key: prepared.get(key, "unknown") for key in
+                      ("color_transfer", "color_primaries", "color_space", "color_range")})
+        asset["decode_origin"] = copy.deepcopy(prepared.get("decode_origin"))
 
     def _video_job_finished(self, ident):
         self.media_job_cancels.pop(ident, None)
@@ -505,7 +596,7 @@ class EditorApp(BaseEditor):
         if not asset or asset_id not in self.video_cache:
             self.status.set("영상 준비가 끝난 뒤 배치하세요."); return
         self._commit_text_draft(); self._change()
-        clip = core.video_defaults(asset_id, max(0, int(frame)), asset["frames"])
+        clip = core.video_defaults(asset_id, max(0, int(frame)), asset["frames"], core.project_size(self.project))
         clip["order"] = core.next_visual_order(self.project)
         self.project["videos"].append(clip)
         self.selection = ("video", clip["id"]); self._refresh()
@@ -520,7 +611,7 @@ class EditorApp(BaseEditor):
         self._commit_text_draft(); self._change()
         start = max((c["end"] for c in core.visual_clips(self.project)), default=0)
         for asset in assets:
-            clip = core.video_defaults(asset["id"], start, asset["frames"])
+            clip = core.video_defaults(asset["id"], start, asset["frames"], core.project_size(self.project))
             clip["order"] = core.next_visual_order(self.project)
             self.project["videos"].append(clip); start = clip["end"]
         self.selection = ("video", clip["id"]); self._refresh()
@@ -561,9 +652,9 @@ class EditorApp(BaseEditor):
                 cache = core.LayerCache(16*1024*1024)
                 try:
                     while not cancel.is_set():
-                        try: request_key, snapshot, number, prepared = requests.get(timeout=.1)
+                        try: request_key, snapshot, number, prepared = requests.get(timeout=.5)
                         except queue.Empty:
-                            if provider: provider.close()
+                            if provider: provider.suspend()
                             continue
                         new_signature = tuple((a["id"], a["path"], a["proxy"]) for a in prepared)
                         if new_signature != signature:
@@ -574,6 +665,7 @@ class EditorApp(BaseEditor):
                             picture = core.render_scene(snapshot, number, video_frames=provider, cache=cache)
                             self.events.put(("video_preview", request_key, picture))
                         except Exception as e:
+                            runtime.log_failure("preview", e)
                             if not cancel.is_set(): self.events.put(("video_preview_error", request_key, str(e)))
                 finally:
                     if provider: provider.close()
@@ -627,10 +719,11 @@ class EditorApp(BaseEditor):
             try:
                 if cancel.is_set() or self.audio_generation_by_id.get(asset["id"]) != token:
                     raise core.EditorError("음악 분석을 취소했습니다.")
-                core.probe_audio(asset["path"], ffprobe, cancel)
-                pcm, bins, samples = core.analyze_audio_asset(asset["path"], ffmpeg, cancel)
+                duration = core.probe_audio(asset["path"], ffprobe, cancel)
+                pcm, bins, samples = core.analyze_audio_asset(asset["path"], ffmpeg, cancel, duration=duration)
                 self.events.put(("audio_ready_v2", asset["id"], token, pcm, bins, samples))
             except Exception as e:
+                runtime.log_failure("audio_import", e)
                 self.events.put(("audio_cancel_v2" if cancel.is_set() else "audio_error_v2",
                                  asset["id"], token, str(e)))
         self.media_executor.submit(worker)
@@ -752,7 +845,7 @@ class EditorApp(BaseEditor):
             elif drag["kind"] == "video":
                 asset = next((a for a in self.project["video_assets"] if a["id"] == drag["id"]), None)
                 if asset and drag["id"] in self.video_cache:
-                    drag["trial"] = core.video_defaults(asset["id"], frame, asset["frames"])
+                    drag["trial"] = core.video_defaults(asset["id"], frame, asset["frames"], core.project_size(self.project))
                 else: drag["valid"] = False
             elif drag["kind"] == "image":
                 drag["trial"] = {"start": frame, "end": min(core.total_frames(self.duration),
@@ -795,7 +888,7 @@ class EditorApp(BaseEditor):
         start = max(0, int(frame)); end = min(core.total_frames(self.duration), start + 5 * core.FPS)
         if end <= start: return
         self._commit_text_draft(); self._change()
-        clip = core.image_defaults(asset_id, start, end)
+        clip = core.image_defaults(asset_id, start, end, core.project_size(self.project))
         clip["order"] = core.next_visual_order(self.project)
         self.project["images"].append(clip)
         self.selection = ("image", clip["id"]); self.seek(start / core.FPS); self._refresh()
@@ -843,7 +936,7 @@ class EditorApp(BaseEditor):
         for index, asset in enumerate(assets):
             begin = start + (end - start) * index // len(assets)
             finish = start + (end - start) * (index + 1) // len(assets)
-            clip = core.image_defaults(asset["id"], begin, finish)
+            clip = core.image_defaults(asset["id"], begin, finish, core.project_size(self.project))
             clip["order"] = core.next_visual_order(self.project)
             self.project["images"].append(clip)
         self.selection = ("image", clip["id"])
@@ -857,8 +950,9 @@ class EditorApp(BaseEditor):
         end = min(core.total_frames(self.duration), start + 3 * core.FPS)
         if end <= start: return
         self._change()
+        width, height = core.project_size(self.project)
         item = {"id": core.uid(), "start": start, "end": end, "text": "텍스트",
-                "x": 960, "y": 840, "width": 1200, "size": 64, "font": "malgun.ttf",
+                "x": width//2, "y": round(height*7/9), "width": round(width*5/8), "size": 64, "font": "malgun.ttf",
                 "color": "#ffffff", "background": "#000000", "background_alpha": 160,
                 "outline": 2, "align": "center",
                 "order": max((t.get("order", 0) for t in self.project["texts"]), default=0) + 1}
@@ -874,6 +968,42 @@ class EditorApp(BaseEditor):
                       "video": self.project["videos"],
                       "text": self.project["texts"]}[self.selection[0]]
         self._change(); collection.remove(item); self.selection = None; self._refresh()
+
+    def split_selected(self):
+        self._commit_text_draft()
+        item = self._selected()
+        if item is None or not self._editable():
+            self.status.set("분할할 클립을 선택하세요."); return
+        kind = self.selection[0]
+        try:
+            left, right = core.split_clip(self.project, kind, item, round(self.position*core.FPS))
+        except core.EditorError as error:
+            self.status.set(str(error)); return
+        collection = self.project[{"audio":"audio_clips", "image":"images", "video":"videos", "text":"texts"}[kind]]
+        self._stop_audio(); self._change()
+        index = collection.index(item)
+        collection[index:index+1] = [left, right]
+        self.selection = (kind, right["id"])
+        self._refresh(); self.timeline.focus_set()
+        self.status.set("클립을 분할했습니다. 오른쪽 조각을 선택했습니다. Ctrl+Z로 되돌릴 수 있습니다.")
+
+    def close_gap(self):
+        if not self._editable(): return
+        self._commit_text_draft()
+        gap = core.empty_gap_at(self.project, round(self.position*core.FPS))
+        if gap is None:
+            self.status.set("음악·화면·문구가 모두 비어 있는 구간에 재생 헤드를 놓으세요."); return
+        begin, end = gap
+        self._stop_audio(); self._change()
+        for item in self.project["audio_clips"]:
+            if item["start_sample"] >= end*(core.RATE//core.FPS):
+                item["start_sample"] -= (end-begin)*(core.RATE//core.FPS)
+        for item in core.visual_clips(self.project) + self.project["texts"]:
+            if item["start"] >= end:
+                item["start"] -= end-begin; item["end"] -= end-begin
+        self.position = begin/core.FPS
+        self._refresh()
+        self.status.set(f"전체 빈 구간 {(end-begin)/core.FPS:.3f}초를 닫았습니다. 뒤쪽 클립을 함께 이동했습니다.")
 
     def copy_selected(self):
         self._commit_text_draft()
@@ -949,69 +1079,9 @@ class EditorApp(BaseEditor):
         self.undo.append(copy.deepcopy(self.project)); self.project = self.redo.pop()
         self.dirty = True; self.selection = None; self.revision += 1; self._recheck_videos(); self._refresh(); self._recheck_audio()
 
-    def save_project(self):
-        self._commit_text_draft()
-        if self.project.get("_migrated") and self.project_file == getattr(self,"_legacy_project_file",None):
-            return self.save_as()
-        return super().save_project()
 
-    def save_as(self):
-        self._commit_text_draft()
-        path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("프로젝트 JSON", "*.json")],
-                 initialfile=(self.project_file.stem + "_v3.json" if self.project_file and self.project.get("_migrated") else None))
-        if not path: return False
-        previous = self.project_file; self.project_file = Path(path)
-        if self.save_project(): self.project.pop("_migrated", None); return True
-        self.project_file = previous; return False
 
-    def new_project(self):
-        self._commit_text_draft()
-        if not self._editable() or not self._confirm_dirty(): return
-        self._stop_audio(); self.audio_cancel.set(); self._dispose_pcm()
-        self._dispose_videos()
-        self.audio_cancel = threading.Event()
-        self.project = core.fresh(); self.project_file = None; self.duration = 0; self.position = 0
-        self.clipboard_clip = None
-        self.undo.clear(); self.redo.clear(); self.selection = None; self.library_selection = None
-        self.dirty = False; self.revision += 1; self.scene_cache_key = None
-        self._refresh()
 
-    def open_project(self):
-        self._commit_text_draft()
-        if not self._editable() or not self._confirm_dirty(): return
-        path = filedialog.askopenfilename(filetypes=[("프로젝트 JSON", "*.json")])
-        if not path: return
-        try:
-            data = core.load_project(path)
-            missing = core.missing_media(data)
-            for kind, asset_id, old in missing:
-                messagebox.showinfo("파일 다시 연결", f"파일을 찾을 수 없습니다:\n{old}\n\n다시 선택하세요.")
-                types = {"audio": [("음악", "*.flac *.wav *.mp3")], "image": [("이미지", "*.jpg *.jpeg *.png")],
-                         "video": [("영상", "*.mp4 *.mov *.mkv *.webm")]}[kind]
-                replacement = filedialog.askopenfilename(filetypes=types)
-                if not replacement: return
-                collection = {"audio": data["audio_assets"], "image": data["assets"], "video": data["video_assets"]}[kind]
-                next(a for a in collection if a["id"] == asset_id)["path"] = replacement
-            self._stop_audio(); self.audio_cancel.set(); self._dispose_pcm()
-            self._dispose_videos()
-            self.audio_cancel = threading.Event()
-            self.project = data; self.project_file = Path(path)
-            self.clipboard_clip = None
-            self._legacy_project_file = Path(path) if data.get("_migrated") else None
-            self.selection = None; self.library_selection = None
-            self.undo.clear(); self.redo.clear(); self.dirty = bool(missing or data.get("_migrated"))
-            self.position = 0; self.revision += 1; self.scene_cache_key = None
-            if data.get("_migrated_v1") and data["audio_assets"]:
-                asset = data["audio_assets"][0]
-                duration = core.probe_audio(asset["path"], self.tool("ffprobe"))
-                asset["samples"] = round(duration * core.RATE)
-                data["audio_clips"][0]["source_out"] = asset["samples"]
-                end = core.total_frames(duration)
-                cues = sorted(data["images"], key=lambda c: c["start"])
-                if cues: cues[-1]["end"] = max(cues[-1]["start"] + 1, end)
-            self._refresh(); self._recheck_audio(); self._recheck_videos()
-            if data.get("_migrated"): self.status.set("이전 프로젝트를 변환했습니다. 저장 시 _v3 이름을 사용하세요.")
-        except core.EditorError as e: messagebox.showerror("열기 오류", str(e))
 
     def show_composition(self):
         if self.composition_dialog and self.composition_dialog.winfo_exists():
@@ -1369,7 +1439,7 @@ class EditorApp(BaseEditor):
                     self.timeline_thumbnail_cache[key]=photo
                 c.create_image(visible_left+8,y+h/2,anchor="w",image=photo,tags=(kind,item["id"]))
                 label_x=visible_left+56
-            except (OSError,ValueError):
+            except (OSError,ValueError,core.EditorError):
                 pass
         if selected and x1-x0 > 18:
             middle=y+h/2
@@ -1555,6 +1625,7 @@ class EditorApp(BaseEditor):
             elif edge == "right":
                 trial["end"]=max(origin["start"]+1,self._snap_frame(origin["end"]+delta,drag["kind"],origin["id"],alt))
             elif edge == "transition":
+                trial["transition"].pop("source", None); trial["transition"].pop("offset_frames", None)
                 trial["transition"]["frames"]=max(1,min(origin["end"]-origin["start"],
                                                           origin["transition"]["frames"]+delta))
             valid_time = trial["start"]>=0 and trial["end"]>trial["start"]
@@ -1584,11 +1655,16 @@ class EditorApp(BaseEditor):
         return None
 
     def render_preview(self):
+        self._refresh_video_format()
+        if hasattr(self, "visual_action_buttons"):
+            state = "normal" if self.selection and self.selection[0] in ("image", "video") and not self.exporting else "disabled"
+            for button in self.visual_action_buttons: button.configure(state=state)
         if not self.preview.winfo_exists(): return
         w,h=self.preview.winfo_width(),self.preview.winfo_height()
         if w<20 or h<20: return
-        scale=min(w/1920,h/1080)
-        width,height=max(1,int(1920*scale)),max(1,int(1080*scale))
+        output_width,output_height=core.project_size(self.project)
+        scale=min(w/output_width,h/output_height)
+        width,height=max(1,int(output_width*scale)),max(1,int(output_height*scale))
         x,y=(w-width)//2,(h-height)//2
         frame=max(0,min(core.total_frames(self.duration)-1,round(self.position*core.FPS)))
         try:
@@ -1615,7 +1691,7 @@ class EditorApp(BaseEditor):
             self.preview_rect=(x,y,width,height)
             item=self._selected()
             if item and self.selection[0]=="text" and item["start"]<=frame<item["end"]:
-                l,t,r,b=core.text_box(item)
+                l,t,r,b=core.text_box(item,core.project_size(self.project))
                 self.preview.create_rectangle(x+l*scale,y+t*scale,x+r*scale,y+b*scale,
                                               outline=UI_COLORS["primary"],width=2)
                 for hx in (x+l*scale, x+r*scale):
@@ -1641,24 +1717,25 @@ class EditorApp(BaseEditor):
         except core.EditorError as e:
             self.status.set(str(e).splitlines()[0])
 
-    @staticmethod
-    def _visible_image_bounds(bounds):
+    def _visible_image_bounds(self,bounds):
+        output_width,output_height=core.project_size(self.project)
         l,t,r,b=bounds
-        visible=(max(0,min(1920,l)),max(0,min(1080,t)),
-                 max(0,min(1920,r)),max(0,min(1080,b)))
+        visible=(max(0,min(output_width,l)),max(0,min(output_height,t)),
+                 max(0,min(output_width,r)),max(0,min(output_height,b)))
         return visible if visible[2]>visible[0] and visible[3]>visible[1] else None
 
     def _preview_target(self, px, py):
+        output_width,output_height=core.project_size(self.project)
         x,y,w,h=self.preview_rect
         if not (x <= px <= x+w and y <= py <= y+h): return None
-        frame=round(self.position*core.FPS)
+        frame=max(0,min(core.total_frames(self.duration)-1,round(self.position*core.FPS)))
         selected=self._selected()
         if selected and self.selection[0]=="text" and selected["start"]<=frame<selected["end"]:
-            l,t,r,b=core.text_box(selected)
-            middle=y+(t+b)*h/2160
+            l,t,r,b=core.text_box(selected,core.project_size(self.project))
+            middle=y+(t+b)*h/(2*output_height)
             if abs(py-middle)<=10:
-                if abs(px-(x+l*w/1920))<=10: return "text",selected,"width_left"
-                if abs(px-(x+r*w/1920))<=10: return "text",selected,"width_right"
+                if abs(px-(x+l*w/output_width))<=10: return "text",selected,"width_left"
+                if abs(px-(x+r*w/output_width))<=10: return "text",selected,"width_right"
         text=self._preview_hit(px,py)
         if text: return "text",text,"move"
         selected_image = (selected if selected and self.selection[0] in ("image","video")
@@ -1677,12 +1754,12 @@ class EditorApp(BaseEditor):
                 visible=self._visible_image_bounds(bounds)
                 if visible:
                     vl,vt,vr,vb=visible
-                    corners=((x+vl*w/1920,y+vt*h/1080),(x+vr*w/1920,y+vt*h/1080),
-                             (x+vl*w/1920,y+vb*h/1080),(x+vr*w/1920,y+vb*h/1080))
+                    corners=((x+vl*w/output_width,y+vt*h/output_height),(x+vr*w/output_width,y+vt*h/output_height),
+                             (x+vl*w/output_width,y+vb*h/output_height),(x+vr*w/output_width,y+vb*h/output_height))
                     if self.selection==(kind,cue["id"]) and any(
                             abs(px-hx)<=10 and abs(py-hy)<=10 for hx,hy in corners):
                         return kind,cue,"zoom"
-                if l <= (px-x)*1920/w <= r and t <= (py-y)*1080/h <= b:
+                if l <= (px-x)*output_width/w <= r and t <= (py-y)*output_height/h <= b:
                     return kind,cue,"move"
         return None
 
@@ -1695,21 +1772,34 @@ class EditorApp(BaseEditor):
         if str(self.preview.cget("cursor"))!=cursor: self.preview.configure(cursor=cursor)
 
     def _preview_down(self,event):
-        self._commit_text_draft(); self.preview.focus_set()
+        self._commit_text_draft()
+        focused = self.root.focus_get()
+        for key, entry in self.property_entries.items():
+            if entry is focused:
+                self._commit_property_entry(entry, key, self.selection[1] if self.selection else None)
+                break
+        self.preview.focus_set()
+        previous_selection = self.selection
+        previous_library = self.library_selection
         target=self._preview_target(event.x,event.y)
         if not target or not self._editable():
             self.selection=None; self.library_selection=None; self.preview_drag=None
-            self._show_properties(); self.render_preview(); self.draw_timeline()
+            if previous_selection is not None or previous_library is not None: self._show_properties()
+            self.render_preview(); self.draw_timeline()
             return
         kind,item,mode=target
         self.selection=(kind,item["id"])
-        original=copy.deepcopy(item["from" if kind=="video" else self.motion_key.get()] if kind in ("image","video") else
+        self.library_selection=None
+        state_key=self._image_edit_key(item) if kind in ("image","video") else None
+        original=copy.deepcopy(item[state_key] if state_key else
                                {key:item[key] for key in ("x","y","width")})
         self.preview_drag={"kind":kind,"id":item["id"],"mode":mode,"x":event.x,"y":event.y,
-                           "original":original,"recorded":False}
-        self._show_properties(); self.render_preview(); self.draw_timeline()
+                           "original":original,"state_key":state_key,"recorded":False}
+        if self.selection != previous_selection: self._show_properties()
+        self.render_preview(); self.draw_timeline()
 
     def _preview_move(self,event):
+        output_width,output_height=core.project_size(self.project)
         drag=self.preview_drag
         if not drag or not self._editable(): return
         item=self._selected()
@@ -1721,43 +1811,44 @@ class EditorApp(BaseEditor):
         if drag["kind"] in ("image","video"):
             trial=dict(origin)
             if drag["mode"]=="zoom":
-                cx=self.preview_rect[0]+origin["x"]*w/1920
-                cy=self.preview_rect[1]+origin["y"]*h/1080
+                cx=self.preview_rect[0]+origin["x"]*w/output_width
+                cy=self.preview_rect[1]+origin["y"]*h/output_height
                 start=math.hypot(drag["x"]-cx,drag["y"]-cy)
                 current=math.hypot(event.x-cx,event.y-cy)
                 trial["zoom"]=max(10,min(500,origin["zoom"]*current/max(1,start)))
             else:
-                trial["x"]=origin["x"]+dx*1920/w
-                trial["y"]=origin["y"]+dy*1080/h
-            if trial==item["from" if drag["kind"]=="video" else self.motion_key.get()]: return
+                trial["x"]=origin["x"]+dx*output_width/w
+                trial["y"]=origin["y"]+dy*output_height/h
+            if trial==item[drag["state_key"]]: return
         else:
             trial=dict(origin)
             if drag["mode"].startswith("width"):
                 left=origin["x"]-origin["width"]/2
                 right=origin["x"]+origin["width"]/2
-                delta=dx*1920/w
-                if drag["mode"]=="width_left": left=min(right-80,max(right-1900,left+delta))
-                else: right=max(left+80,min(left+1900,right+delta))
+                delta=dx*output_width/w
+                if drag["mode"]=="width_left": left=min(right-80,max(right-(output_width-20),left+delta))
+                else: right=max(left+80,min(left+(output_width-20),right+delta))
                 trial["width"]=round(right-left)
                 trial["x"]=(left+right)/2
             else:
-                trial["x"]=max(0,min(1920,origin["x"]+dx*1920/w))
-                trial["y"]=max(0,min(1080,origin["y"]+dy*1080/h))
+                trial["x"]=max(0,min(output_width,origin["x"]+dx*output_width/w))
+                trial["y"]=max(0,min(output_height,origin["y"]+dy*output_height/h))
             if all(item[key]==value for key,value in trial.items()): return
         if not drag["recorded"]:
             self._change(); drag["recorded"]=True
-        elif drag["kind"]=="video": self.revision += 1
+        else: self.revision += 1
         if drag["kind"] in ("image","video"):
-            item["from" if drag["kind"]=="video" else self.motion_key.get()].update(trial)
+            item[drag["state_key"]].update(trial)
             if drag["kind"]=="video": item["to"] = dict(item["from"])
             item.pop("legacy_native",None)
         else: item.update(trial)
-        self.scene_cache_key=None; self.render_preview()
+        self.scene_cache_key=None; self.render_preview(); self._sync_preview_properties()
 
     def _preview_up(self,event):
         drag=self.preview_drag
         self.preview_drag=None
-        if drag and drag["recorded"]: self._refresh()
+        if drag and drag["recorded"]:
+            self._refresh(False); self._sync_preview_properties()
 
     def seek(self,seconds):
         self._commit_text_draft()
@@ -1791,6 +1882,7 @@ class EditorApp(BaseEditor):
             try:
                 import sounddevice as sd
                 self.play_frames=0
+                meter_at = 0
                 with core.AudioMixer(clips, paths) as mixer, \
                         sd.RawOutputStream(samplerate=core.RATE,channels=2,dtype="float32",blocksize=2048) as stream:
                     self.play_latency=stream.latency
@@ -1798,6 +1890,9 @@ class EditorApp(BaseEditor):
                     while cursor<final and not cancel.is_set():
                         count=min(2048,final-cursor)
                         raw=mixer.read(cursor,count)
+                        if time.monotonic() >= meter_at:
+                            self.events.put(("audio_meter", cancel, core.pcm_peak_db(raw)))
+                            meter_at = time.monotonic() + .1
                         stream.write(raw)
                         cursor+=count; self.play_frames+=count
                 if not cancel.is_set(): self.events.put(("play_end",))
@@ -1816,6 +1911,7 @@ class EditorApp(BaseEditor):
         self.root.after(33,self._tick)
 
     def start_export(self):
+        if self._activate_export_dialog(): return
         self._commit_text_draft()
         if self.video_pending or self.audio_pending:
             messagebox.showwarning("내보내기", "영상·음원 준비가 끝날 때까지 기다리세요."); return
@@ -1845,14 +1941,24 @@ class EditorApp(BaseEditor):
             self.export_start_button.configure(state="disabled")
             self.export_cancel_button.configure(text="작업 취소")
         snapshot=copy.deepcopy(self.project); duration=self.duration; cancel=self.export_cancel
+        self.export_size = core.project_size(snapshot)
+        quality = self.export_quality_var.get() if hasattr(self, "export_quality_var") else core.DEFAULT_EXPORT_QUALITY
+        acceleration = core.EXPORT_ACCELERATIONS[self.export_acceleration_var.get()] if hasattr(self, "export_acceleration_var") else "cpu"
+        audio_mode = core.EXPORT_AUDIO_MODES[self.export_audio_var.get()] if hasattr(self, "export_audio_var") else "original"
+        self.export_encoder_status = ""
+        self.export_audio_status = ""
         paths={key:value["pcm"] for key,value in self.audio_cache.items()}
         paths.update({"video:"+key:value["pcm"] for key,value in self.video_cache.items() if value.get("pcm")})
         def worker():
             try:
                 result=core.export_video(snapshot,duration,path,ffmpeg,cancel,
-                                         lambda n:self.events.put(("progress",n)),paths)
+                                         lambda n:self.events.put(("progress",n)),paths,quality=quality,acceleration=acceleration,
+                                         on_encoder=lambda message:self.events.put(("encoder_status",message)), audio_mode=audio_mode,
+                                         on_audio=lambda message:self.events.put(("audio_status",message)))
                 self.events.put(("export_done",result))
-            except Exception as e: self.events.put(("export_error",str(e)))
+            except Exception as e:
+                runtime.log_failure("export", e)
+                self.events.put(("export_error",str(e)))
         self.export_thread=threading.Thread(target=worker,daemon=True); self.export_thread.start()
 
     def _poll(self):
@@ -1933,12 +2039,25 @@ class EditorApp(BaseEditor):
                     self._update_audio_import_display()
                 elif kind=="play_error":
                     self._stop_audio(); self.status.set(event[1].splitlines()[0]); messagebox.showerror("재생 오류",event[1])
+                elif kind=="audio_meter":
+                    if self.playing and event[1] is self.play_stop and not event[1].is_set():
+                        peak = event[2]
+                        self.audio_meter_var.set((f"피크 {peak:.1f} dBFS" if math.isfinite(peak) else "피크 -∞ dBFS")
+                                                 + (" · 주의" if peak >= -.1 else ""))
                 elif kind=="play_end":
                     self._stop_audio(); self.position=self.duration; self._refresh(False)
                 elif kind=="progress":
                     self.progress.set(event[1]); self.status.set(f"MP4 내보내는 중… {event[1]}%")
                     if self.export_dialog and self.export_dialog.winfo_exists():
                         self.export_status_label.configure(text=f"MP4 만드는 중… {event[1]}%")
+                elif kind=="encoder_status":
+                    self.export_encoder_status = event[1]; self.status.set(event[1])
+                    if self.export_dialog and self.export_dialog.winfo_exists():
+                        self.export_status_label.configure(text=event[1])
+                elif kind=="audio_status":
+                    self.export_audio_status = event[1]; self.status.set(event[1])
+                    if self.export_dialog and self.export_dialog.winfo_exists():
+                        self.export_status_label.configure(text=event[1])
                 elif kind=="export_done":
                     self.exporting=False; self.last_output=event[1]; self.progress.set(100)
                     self.render_preview()
@@ -1964,6 +2083,7 @@ class EditorApp(BaseEditor):
         if self.exporting:
             self.export_cancel.set(); self.root.after(100,self.close); return
         if not self._confirm_dirty(): return
+        self._discard_recovery()
         self._save_ui_settings(); self._stop_audio(); self.audio_cancel.set()
         self._dispose_videos()
         self.media_executor.shutdown(wait=False, cancel_futures=True)
